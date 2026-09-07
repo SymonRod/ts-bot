@@ -1,0 +1,40 @@
+# Esempio: avvio del bot dall'immagine pubblicata su GHCR (niente build locale).
+# Uso:
+#   cp .env.example .env        # poi compila TS_SERVER (e password/canale se servono)
+#   docker compose -f docker-compose.example.yml up -d
+#   docker compose -f docker-compose.example.yml logs -f
+
+services:
+  music-bot:
+    image: ghcr.io/symonrod/ts-bot:latest
+    container_name: ts-music-bot
+    restart: unless-stopped
+    environment:
+      BOT_BIN: music-bot
+      TS_SERVER: ${TS_SERVER:?imposta TS_SERVER nel file .env (es. voce.example.com:9987)}
+      TS_NICKNAME: ${TS_NICKNAME:-MusicBot}
+      TS_CHANNEL: ${TS_CHANNEL:-}
+      TS_PASSWORD: ${TS_PASSWORD:-}
+      TS_PREFIX: ${TS_PREFIX:-!}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Identità e stato persistente (identity-music.json, music-state.json).
+      - ./data:/data
+
+  # Variante solo-chat (testuale, senza audio):
+  #   docker compose -f docker-compose.example.yml --profile chat up -d chat-bot
+  chat-bot:
+    profiles: ["chat"]
+    image: ghcr.io/symonrod/ts-bot:latest
+    container_name: ts-chat-bot
+    restart: unless-stopped
+    environment:
+      BOT_BIN: chat-bot
+      TS_SERVER: ${TS_SERVER:?imposta TS_SERVER nel file .env (es. voce.example.com:9987)}
+      TS_NICKNAME: ${TS_NICKNAME:-TsBot}
+      TS_CHANNEL: ${TS_CHANNEL:-}
+      TS_PASSWORD: ${TS_PASSWORD:-}
+      TS_PREFIX: ${TS_PREFIX:-!}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./data:/data
