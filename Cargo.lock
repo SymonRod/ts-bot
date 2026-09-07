@@ -3096,7 +3096,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "ts-bookkeeping"
 version = "0.1.0"
-source = "git+https://github.com/ReSpeak/tsclientlib.git#ee3bc6f45a7137db7793ba5593a321df400d53e5"
+source = "git+https://github.com/SymonRod/tsclientlib.git?branch=ts6-client-is-streaming#298e43145dd4a20c4b57be8ed27d5cae9395657b"
 dependencies = [
  "base64 0.22.1",
  "heck",
@@ -3133,7 +3133,7 @@ dependencies = [
 [[package]]
 name = "tsclientlib"
 version = "0.2.0"
-source = "git+https://github.com/ReSpeak/tsclientlib.git#ee3bc6f45a7137db7793ba5593a321df400d53e5"
+source = "git+https://github.com/SymonRod/tsclientlib.git?branch=ts6-client-is-streaming#298e43145dd4a20c4b57be8ed27d5cae9395657b"
 dependencies = [
  "audiopus",
  "base64 0.22.1",
@@ -3245,7 +3245,7 @@ dependencies = [
 [[package]]
 name = "tsproto"
 version = "0.2.0"
-source = "git+https://github.com/ReSpeak/tsclientlib.git#ee3bc6f45a7137db7793ba5593a321df400d53e5"
+source = "git+https://github.com/SymonRod/tsclientlib.git?branch=ts6-client-is-streaming#298e43145dd4a20c4b57be8ed27d5cae9395657b"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -3275,7 +3275,7 @@ dependencies = [
 [[package]]
 name = "tsproto-packets"
 version = "0.1.0"
-source = "git+https://github.com/ReSpeak/tsclientlib.git#ee3bc6f45a7137db7793ba5593a321df400d53e5"
+source = "git+https://github.com/SymonRod/tsclientlib.git?branch=ts6-client-is-streaming#298e43145dd4a20c4b57be8ed27d5cae9395657b"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.1",
@@ -3290,7 +3290,7 @@ dependencies = [
 [[package]]
 name = "tsproto-structs"
 version = "0.2.0"
-source = "git+https://github.com/ReSpeak/tsclientlib.git#ee3bc6f45a7137db7793ba5593a321df400d53e5"
+source = "git+https://github.com/SymonRod/tsclientlib.git?branch=ts6-client-is-streaming#298e43145dd4a20c4b57be8ed27d5cae9395657b"
 dependencies = [
  "base64 0.22.1",
  "csv",
@@ -3303,7 +3303,7 @@ dependencies = [
 [[package]]
 name = "tsproto-types"
 version = "0.1.0"
-source = "git+https://github.com/ReSpeak/tsclientlib.git#ee3bc6f45a7137db7793ba5593a321df400d53e5"
+source = "git+https://github.com/SymonRod/tsclientlib.git?branch=ts6-client-is-streaming#298e43145dd4a20c4b57be8ed27d5cae9395657b"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.1",
