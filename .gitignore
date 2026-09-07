@@ -1,0 +1,17 @@
+# Binari e dipendenze
+/target/
+# (./tslib è un submodule git: NON ignorarlo, è tracciato come gitlink)
+
+# Stato locale del bot: identità e canale/volume vanno montati come volume,
+# non committati (l'identità è un segreto: chi la possiede impersona il bot).
+identity*.json
+music-state.json
+data/
+.data/
+
+# Varie
+*.log
+.env
+.DS_Store
+.idea/
+.vscode/

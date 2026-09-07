@@ -1,0 +1,4 @@
+[submodule "tslib"]
+	path = tslib
+	url = https://github.com/SymonRod/tslib_multi.git
+	branch = fix/android-context-and-panic-guard

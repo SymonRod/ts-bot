@@ -1,0 +1,27 @@
+[package]
+name = "ts-bot"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "chat-bot"
+path = "src/main.rs"
+
+[[bin]]
+name = "music-bot"
+path = "src/bin/music-bot.rs"
+
+[dependencies]
+# tslib è un submodule in ./tslib (vedi .gitmodules).
+tslib-core = { path = "tslib/crates/tslib-core" }
+tslib-bot = { path = "tslib/crates/tslib-bot" }
+tslib-audio = { path = "tslib/crates/tslib-audio" }
+tslib-chat = { path = "tslib/crates/tslib-chat" }
+
+tokio = { version = "1.36", features = ["full"] }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

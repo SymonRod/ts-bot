@@ -1,0 +1,39 @@
+# Esecuzione locale via Docker Compose.
+# L'immagine dal registry si usa così (sostituisci owner/repo):
+#   image: ghcr.io/<owner>/<repo>:latest
+# Oppure build locale con `docker compose up --build`.
+
+services:
+  music-bot:
+    build: .
+    # image: ghcr.io/<owner>/<repo>:latest
+    container_name: ts-music-bot
+    restart: unless-stopped
+    environment:
+      BOT_BIN: music-bot
+      TS_SERVER: ${TS_SERVER:?imposta TS_SERVER in .env (es. voce.example.com:9987)}
+      TS_NICKNAME: ${TS_NICKNAME:-MusicBot}
+      TS_CHANNEL: ${TS_CHANNEL:-}
+      TS_PASSWORD: ${TS_PASSWORD:-}
+      TS_PREFIX: ${TS_PREFIX:-!}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./data:/data
+
+  # chat-bot (testuale, senza audio): profilo opzionale
+  #   docker compose --profile chat up --build chat-bot
+  chat-bot:
+    profiles: ["chat"]
+    build: .
+    container_name: ts-chat-bot
+    restart: unless-stopped
+    environment:
+      BOT_BIN: chat-bot
+      TS_SERVER: ${TS_SERVER:?imposta TS_SERVER in .env (es. voce.example.com:9987)}
+      TS_NICKNAME: ${TS_NICKNAME:-TsBot}
+      TS_CHANNEL: ${TS_CHANNEL:-}
+      TS_PASSWORD: ${TS_PASSWORD:-}
+      TS_PREFIX: ${TS_PREFIX:-!}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./data:/data
