@@ -12,7 +12,8 @@
 //!
 //! Comandi in chat:
 //!   !help, !users, !channels, !join <id|nome>, !say <msg>,
-//!   !play <url|hz>, !stop, !skip, !queue, !now, !volume <0-200>
+//!   !play <url|hz>, !stop, !skip, !queue, !now, !volume <0-200>,
+//!   !pause, !resume
 
 use std::collections::VecDeque;
 use std::process::Stdio;
@@ -111,6 +112,28 @@ impl BotState {
     }
 }
 
+/// Un brano in coda o in riproduzione: URL + titolo (se risolto via yt-dlp).
+#[derive(Debug, Clone)]
+struct Track {
+    url: String,
+    /// Titolo YouTube (es. "Big Buck Bunny ..."). Se `None`, si mostra l'URL.
+    title: Option<String>,
+}
+
+impl Track {
+    fn new(url: String, title: Option<String>) -> Self {
+        let title = title
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        Self { url, title }
+    }
+
+    /// Testo da mostrare in chat: preferisce il titolo all'URL.
+    fn display(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.url)
+    }
+}
+
 /// Sorgente audio attiva. Resta nel task principale perché `Client` non è `Send`.
 enum Source {
     Idle,
@@ -123,7 +146,6 @@ struct PipeStream {
     ytdlp: tokio::process::Child,
     ffmpeg: tokio::process::Child,
     stdout: tokio::process::ChildStdout,
-    url: String,
     /// Buffer di accumulo: ffmpeg produce più in fretta del realtime,
     /// ne consumiamo un frame (960 sample) per tick da 20ms.
     pending: Vec<u8>,
@@ -139,16 +161,25 @@ impl PipeStream {
 /// Stato di riproduzione + coda.
 struct Player {
     source: Source,
-    queue: VecDeque<String>,
-    /// URL corrente o descrizione ("sine 440Hz").
-    current: Option<String>,
+    queue: VecDeque<Track>,
+    /// Brano corrente (URL + titolo) o descrizione ("sine 440Hz").
+    current: Option<Track>,
     /// Volume 0.0-2.0 (1.0 = 100%). Applicato ai sample PCM prima dell'encode Opus.
     volume: f32,
+    /// Pausa: se true, non si legge da ffmpeg né si invia audio
+    /// (ffmpeg si blocca da solo per backpressure sulla pipe).
+    paused: bool,
 }
 
 impl Player {
     fn new(volume: f32) -> Self {
-        Self { source: Source::Idle, queue: VecDeque::new(), current: None, volume }
+        Self {
+            source: Source::Idle,
+            queue: VecDeque::new(),
+            current: None,
+            volume,
+            paused: false,
+        }
     }
 
     fn is_busy(&self) -> bool {
@@ -159,16 +190,26 @@ impl Player {
         kill_source(&mut self.source);
         self.queue.clear();
         self.current = None;
+        self.paused = false;
     }
 
-    /// Fa partire l'URL subito, uccidendo la sorgente precedente.
-    fn start_url_now(&mut self, url: String) -> String {
-        match spawn_stream(&url) {
+    fn current_display(&self) -> String {
+        self.current
+            .as_ref()
+            .map(|t| t.display().to_string())
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    /// Fa partire il brano subito, uccidendo la sorgente precedente.
+    fn start_track_now(&mut self, track: Track) -> String {
+        match spawn_stream(&track.url) {
             Ok(stream) => {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
-                self.current = Some(url.clone());
-                format!("Riproduco: {url}")
+                let name = track.display().to_string();
+                self.current = Some(track);
+                self.paused = false;
+                format!("Riproduco: {name}")
             }
             Err(e) => format!("Play fallito: {e:#}"),
         }
@@ -177,14 +218,16 @@ impl Player {
     /// Fa partire il prossimo in coda. Ritorna il messaggio da annunciare (se c'è).
     fn start_next(&mut self) -> Option<String> {
         let next = self.queue.pop_front()?;
-        match spawn_stream(&next) {
+        match spawn_stream(&next.url) {
             Ok(stream) => {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
-                self.current = Some(next.clone());
-                Some(format!("Prossimo: {next}"))
+                let name = next.display().to_string();
+                self.current = Some(next);
+                self.paused = false;
+                Some(format!("Prossimo: {name}"))
             }
-            Err(e) => Some(format!("Play fallito per {next}: {e:#}")),
+            Err(e) => Some(format!("Play fallito per {}: {e:#}", next.display())),
         }
     }
 }
@@ -224,23 +267,43 @@ fn spawn_stream(url: &str) -> Result<PipeStream> {
         anyhow::bail!("URL non valido (deve iniziare con http:// o https://)");
     }
     let mut ytdlp = tokio::process::Command::new("yt-dlp")
-        .args(["-f", "bestaudio", "-o", "-", "--no-playlist", "--quiet", "--no-warnings", url])
+        .args([
+            "-f",
+            "bestaudio",
+            "-o",
+            "-",
+            "--no-playlist",
+            "--quiet",
+            "--no-warnings",
+            url,
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .context("yt-dlp non trovato o non avviabile (installarlo sul host)")?;
 
-    let ytdlp_out = ytdlp.stdout.take().context("yt-dlp: stdout non disponibile")?;
+    let ytdlp_out = ytdlp
+        .stdout
+        .take()
+        .context("yt-dlp: stdout non disponibile")?;
     let ytdlp_stdio: Stdio = ytdlp_out
         .try_into()
         .map_err(|_| anyhow::anyhow!("conversione stdout yt-dlp fallita"))?;
 
     let mut ffmpeg = tokio::process::Command::new("ffmpeg")
         .args([
-            "-hide_banner", "-loglevel", "error",
-            "-i", "pipe:0",
-            "-f", "s16le", "-ar", "48000", "-ac", "1",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
             "pipe:1",
         ])
         .stdin(ytdlp_stdio)
@@ -250,9 +313,78 @@ fn spawn_stream(url: &str) -> Result<PipeStream> {
         .spawn()
         .context("ffmpeg non trovato o non avviabile (installarlo sul host)")?;
 
-    let stdout = ffmpeg.stdout.take().context("ffmpeg: stdout non disponibile")?;
+    let stdout = ffmpeg
+        .stdout
+        .take()
+        .context("ffmpeg: stdout non disponibile")?;
 
-    Ok(PipeStream { ytdlp, ffmpeg, stdout, url: url.to_string(), pending: Vec::with_capacity(8192) })
+    Ok(PipeStream {
+        ytdlp,
+        ffmpeg,
+        stdout,
+        pending: Vec::with_capacity(8192),
+    })
+}
+
+/// Risolve un URL in uno o più brani con titolo.
+///
+/// Usa `yt-dlp --flat-playlist --print "%(title)s ||| %(webpage_url)s"`: se l'URL
+/// è una playlist (o un video con `&list=`), restituisce tutti i brani con titolo;
+/// se è un singolo video, restituisce un solo brano. In caso di errore, torna
+/// comunque un brano con l'URL grezzo (titolo sconosciuto) così la riproduzione
+/// parte lo stesso.
+async fn resolve_tracks(url: String) -> Vec<Track> {
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::process::Command::new("yt-dlp")
+            .args([
+                "--flat-playlist",
+                "--no-warnings",
+                "--quiet",
+                "--print",
+                "%(title)s ||| %(webpage_url)s",
+                &url,
+            ])
+            .output(),
+    )
+    .await;
+
+    let output = match out {
+        Ok(Ok(o)) if o.status.success() => o,
+        Ok(Ok(o)) => {
+            warn!(
+                "yt-dlp titolo fallito per {url}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return vec![Track::new(url, None)];
+        }
+        _ => {
+            warn!("yt-dlp titolo timeout/errore per {url}");
+            return vec![Track::new(url, None)];
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut tracks = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((title, link)) = line.split_once(" ||| ") {
+            let link = link.trim();
+            if link.is_empty() {
+                continue;
+            }
+            tracks.push(Track::new(link.to_string(), Some(title.to_string())));
+        }
+    }
+    if tracks.is_empty() {
+        vec![Track::new(url, None)]
+    } else {
+        info!("Risolti {} brani da {url}", tracks.len());
+        tracks
+    }
 }
 
 #[tokio::main]
@@ -322,6 +454,11 @@ async fn main() -> Result<()> {
     let mut player = Player::new(saved.volume);
     let sample_rate = audio_cfg.sample_rate as f64;
 
+    // Risoluzione titoli/playlist in background: `handle_chat` fa solo
+    // `tokio::spawn(resolve_tracks(url))` e risponde subito "Caricamento...",
+    // così il tick audio da 20ms non si blocca. I risultati arrivano qui.
+    let (meta_tx, mut meta_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Track>>();
+
     let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(20));
 
     loop {
@@ -343,6 +480,7 @@ async fn main() -> Result<()> {
                                         &mut player,
                                         &args.state,
                                         &mut saved,
+                                        meta_tx.clone(),
                                     ) {
                                         // Risponde nello stesso contesto:
                                         // DM/server → messaggio privato, canale → messaggio in canale
@@ -386,8 +524,61 @@ async fn main() -> Result<()> {
                     Err(e) => warn!("process_events: {e}"),
                 }
 
+                // 1b) Brani risolti in background (titoli/playlist via yt-dlp)
+                while let Ok(tracks) = meta_rx.try_recv() {
+                    if tracks.is_empty() {
+                        continue;
+                    }
+                    let n = tracks.len();
+                    if player.is_busy() {
+                        // C'è già qualcosa in riproduzione: accoda tutto.
+                        let first = tracks[0].display().to_string();
+                        for t in tracks {
+                            player.queue.push_back(t);
+                        }
+                        if n == 1 {
+                            let _ = client.send_channel_message(format!(
+                                "In coda (#{}) : {first}",
+                                player.queue.len()
+                            ));
+                        } else {
+                            let _ = client.send_channel_message(format!(
+                                "Playlist: aggiunti {n} brani in coda (tot. {}). Primo: {first}",
+                                player.queue.len(),
+                                first = first
+                            ));
+                        }
+                    } else {
+                        // Libero: parte subito il primo, il resto in coda.
+                        let mut it = tracks.into_iter();
+                        let first = it.next().expect("non vuoto");
+                        let rest: Vec<Track> = it.collect();
+                        let rest_n = rest.len();
+                        for t in rest {
+                            player.queue.push_back(t);
+                        }
+                        let msg = player.start_track_now(first);
+                        let _ = client.set_input_muted(false);
+                        if rest_n > 0 {
+                            let _ = client.send_channel_message(format!(
+                                "Playlist: {rest_n_plus} brani in coda.\n{msg}",
+                                rest_n_plus = rest_n + 1,
+                                msg = msg
+                            ));
+                        } else {
+                            let _ = client.send_channel_message(msg);
+                        }
+                    }
+                }
+
                 // 2) Streaming audio: un frame Opus ogni 20ms
+                // Se in pausa: non leggiamo da ffmpeg (backpressure = freeze)
+                // e non inviamo audio.
                 let vol = player.volume;
+                let paused = player.paused;
+                if paused {
+                    continue;
+                }
                 match &mut player.source {
                     Source::Idle => {}
                     Source::Sine { freq, phase } => {
@@ -433,10 +624,10 @@ async fn main() -> Result<()> {
                             }
                         }
                         if stream_ended {
-                            let finished = stream.url.clone();
+                            let finished = player.current_display();
                             kill_source(&mut player.source);
                             player.current = None;
-                            // Auto-avanza con la coda
+                            // Auto-avanza con la coda, annunciando i titoli
                             if let Some(msg) = player.start_next() {
                                 let _ = client.send_channel_message(format!("Finito: {finished}\n{msg}"));
                             } else {
@@ -502,6 +693,7 @@ fn handle_chat(
     player: &mut Player,
     state_path: &str,
     saved: &mut BotState,
+    meta_tx: tokio::sync::mpsc::UnboundedSender<Vec<Track>>,
 ) -> Option<String> {
     let msg = message.trim();
     if !msg.starts_with(prefix) {
@@ -514,7 +706,7 @@ fn handle_chat(
 
     match cmd.as_str() {
         "help" => Some(
-            "Comandi: !help !users !channels !join <id|nome> !say <msg> !play <url|hz> !stop !skip !queue !now !volume <0-200>".to_string(),
+            "Comandi: !help !users !channels !join <id|nome> !say <msg> !play <url|hz> !stop !skip !queue !now !volume <0-200> !pause !resume".to_string(),
         ),
         "users" => {
             let mut users = client.users();
@@ -580,22 +772,24 @@ fn handle_chat(
                 // Se c'è già uno stream, la sinusoide lo sostituisce (e svuota la coda? no: resta).
                 kill_source(&mut player.source);
                 player.source = Source::Sine { freq: f, phase: 0.0 };
-                player.current = Some(format!("sine {f:.0}Hz"));
+                player.current = Some(Track::new(format!("sine {f:.0}Hz"), Some(format!("sine {f:.0}Hz"))));
+                player.paused = false;
                 let _ = client.set_input_muted(false);
                 return Some(format!("Riproduzione nota a {f:.0} Hz (OpusMusic). !stop per fermare."));
             }
-            // Altrimenti URL
+            // Altrimenti URL: risolvi titolo/playlist in background per non
+            // bloccare il tick audio da 20ms. L'annuncio col titolo arriva in canale.
             let url = arg.to_string();
             if !is_url(&url) {
                 return Some("Uso: !play <url YouTube> oppure !play [hz 50-2000]".to_string());
             }
             let _ = client.set_input_muted(false);
-            if player.is_busy() {
-                player.queue.push_back(url.clone());
-                Some(format!("In coda (#{}) : {url}", player.queue.len()))
-            } else {
-                Some(player.start_url_now(url))
-            }
+            let tx = meta_tx.clone();
+            tokio::spawn(async move {
+                let tracks = resolve_tracks(url).await;
+                let _ = tx.send(tracks);
+            });
+            Some("Caricamento... (risolvo titolo/playlist)".to_string())
         }
         "stop" => {
             player.stop_all();
@@ -604,26 +798,51 @@ fn handle_chat(
         "skip" => {
             kill_source(&mut player.source);
             player.current = None;
+            player.paused = false;
             if let Some(msg) = player.start_next() {
                 Some(format!("Skip. {msg}"))
             } else {
                 Some("Skip. Niente altro in coda.".to_string())
             }
         }
+        "pause" | "pausa" => {
+            if !player.is_busy() {
+                return Some("Niente in riproduzione.".to_string());
+            }
+            if player.paused {
+                return Some("Già in pausa.".to_string());
+            }
+            player.paused = true;
+            Some(format!("Pausa: {}", player.current_display()))
+        }
+        "resume" | "unpause" | "continue" | "riprendi" => {
+            if !player.is_busy() {
+                return Some("Niente in riproduzione.".to_string());
+            }
+            if !player.paused {
+                return Some("Già in riproduzione.".to_string());
+            }
+            player.paused = false;
+            let _ = client.set_input_muted(false);
+            Some(format!("Ripresa: {}", player.current_display()))
+        }
         "queue" => {
             if player.queue.is_empty() {
                 return Some("Coda vuota.".to_string());
             }
             let mut out = format!("Coda ({}):\n", player.queue.len());
-            for (i, u) in player.queue.iter().take(10).enumerate() {
-                out.push_str(&format!("{}. {u}\n", i + 1));
+            for (i, t) in player.queue.iter().take(10).enumerate() {
+                out.push_str(&format!("{}. {}\n", i + 1, t.display()));
             }
             Some(out)
         }
-        "now" | "nowplaying" | "np" => match &player.current {
-            Some(c) => Some(format!("In riproduzione: {c} (vol {:.0}%)", player.volume * 100.0)),
-            None => Some(format!("Niente in riproduzione. (vol {:.0}%)", player.volume * 100.0)),
-        },
+        "now" | "nowplaying" | "np" => {
+            let state = if player.paused { " (in pausa)" } else { "" };
+            match &player.current {
+                Some(c) => Some(format!("In riproduzione{state}: {} (vol {:.0}%)", c.display(), player.volume * 100.0)),
+                None => Some(format!("Niente in riproduzione. (vol {:.0}%)", player.volume * 100.0)),
+            }
+        }
         "volume" | "vol" => {
             if rest.is_empty() {
                 return Some(format!("Volume: {:.0}% (uso: !volume 0-200)", player.volume * 100.0));
