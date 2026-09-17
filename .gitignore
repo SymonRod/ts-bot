@@ -6,6 +6,7 @@
 # non committati (l'identità è un segreto: chi la possiede impersona il bot).
 identity*.json
 music-state.json
+playlists.json
 data/
 .data/
 

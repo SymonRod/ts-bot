@@ -13,7 +13,9 @@
 //! Comandi in chat:
 //!   !help, !users, !channels, !join <id|nome>, !say <msg>,
 //!   !play <url|hz>, !stop, !skip, !queue, !now, !volume <0-200>,
-//!   !pause, !resume
+//!   !pause, !resume, !eq <preset|show|list>, !bass/!mid/!treble <-12..+12>,
+//!   !loop [off|one|all], !lofi, !playlist <nome>, !playlists,
+//!   !playlistsave <nome>, !playlistdel <nome>
 
 use std::collections::VecDeque;
 use std::process::Stdio;
@@ -60,10 +62,14 @@ struct Args {
     /// File stato persistente (volume + ultimo canale)
     #[arg(long, default_value = "music-state.json")]
     state: String,
+
+    /// File playlist salvate (nome -> lista URL)
+    #[arg(long, default_value = "playlists.json")]
+    playlists: String,
 }
 
-/// Stato persistente tra riavvii: volume e ultimo canale joinato.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Stato persistente tra riavvii: volume, EQ, loop e ultimo canale joinato.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BotState {
     /// Volume 0.0-2.0 (default 1.0).
     #[serde(default = "default_volume")]
@@ -73,6 +79,42 @@ struct BotState {
     channel_id: Option<u64>,
     #[serde(default)]
     channel_name: Option<String>,
+    /// EQ a 3 bande in dB (-12..+12). Default 0 = flat.
+    #[serde(default)]
+    eq_bass: f32,
+    #[serde(default)]
+    eq_mid: f32,
+    #[serde(default)]
+    eq_treble: f32,
+    /// Nome preset EQ attivo ("flat", "rock", "custom", ...).
+    #[serde(default = "default_eq_preset")]
+    eq_preset: String,
+    /// Modalità loop: "off" | "one" | "all".
+    #[serde(default = "default_loop_mode")]
+    loop_mode: String,
+}
+
+impl Default for BotState {
+    fn default() -> Self {
+        Self {
+            volume: default_volume(),
+            channel_id: None,
+            channel_name: None,
+            eq_bass: 0.0,
+            eq_mid: 0.0,
+            eq_treble: 0.0,
+            eq_preset: default_eq_preset(),
+            loop_mode: default_loop_mode(),
+        }
+    }
+}
+
+fn default_eq_preset() -> String {
+    "flat".to_string()
+}
+
+fn default_loop_mode() -> String {
+    "off".to_string()
 }
 
 fn default_volume() -> f32 {
@@ -110,27 +152,384 @@ impl BotState {
         }
         v.clamp(0.0, 2.0)
     }
+
+    fn sanitized_eq_db(v: f32) -> f32 {
+        if !v.is_finite() {
+            return 0.0;
+        }
+        v.clamp(-12.0, 12.0)
+    }
 }
 
-/// Un brano in coda o in riproduzione: URL + titolo (se risolto via yt-dlp).
+/// Un brano in coda o in riproduzione: URL + titolo + copertina (se risolti via yt-dlp).
 #[derive(Debug, Clone)]
 struct Track {
     url: String,
     /// Titolo YouTube (es. "Big Buck Bunny ..."). Se `None`, si mostra l'URL.
     title: Option<String>,
+    /// URL della copertina (thumbnail YouTube). Se `Some`, viene inviata come
+    /// `[img]...[/img]` così il client TeamSpeak mostra la preview inline.
+    thumbnail: Option<String>,
 }
 
 impl Track {
-    fn new(url: String, title: Option<String>) -> Self {
+    fn new(url: String, title: Option<String>, thumbnail: Option<String>) -> Self {
         let title = title
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
-        Self { url, title }
+        let thumbnail = thumbnail
+            .map(|t| t.trim().to_string())
+            .filter(|t| t.starts_with("http://") || t.starts_with("https://"));
+        Self {
+            url,
+            title,
+            thumbnail,
+        }
     }
 
     /// Testo da mostrare in chat: preferisce il titolo all'URL.
     fn display(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.url)
+    }
+
+    /// Annuncio ricco per la chat TeamSpeak: titolo in grassetto + copertina
+    /// inline (preview, non file allegato) + link originale.
+    /// `prefix` è la riga iniziale (es. "Riproduco", "Prossimo", "In riproduzione").
+    fn announce(&self, prefix: &str) -> String {
+        let name = self.display();
+        match &self.thumbnail {
+            Some(thumb) => format!("[b]{prefix}: {name}[/b]\n[img]{thumb}[/img]\n{url}", url = self.url),
+            None => format!("[b]{prefix}: {name}[/b]\n{url}", url = self.url),
+        }
+    }
+}
+
+/// Modalità di ripetizione della riproduzione.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopMode {
+    Off,
+    One,
+    All,
+}
+
+impl LoopMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "no" | "0" => Some(Self::Off),
+            "one" | "uno" | "1" | "track" | "brano" => Some(Self::One),
+            "all" | "tutti" | "coda" | "queue" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::One => "one",
+            Self::All => "all",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Equalizer a 3 bande (biquad RBJ in serie, mono 48kHz).
+//
+// Catena: low-shelf 200Hz -> peaking 1kHz (Q=1) -> high-shelf 6kHz.
+// I guadagni sono in dB (-12..+12). Con 0dB la banda è in bypass.
+// Viene applicato sul PCM prima dell'encode Opus, quindi il cambio preset
+// è istantaneo e non richiede il riavvio dello stream.
+// ---------------------------------------------------------------------------
+
+/// Un filtro biquad del secondo ordine (forma diretta I).
+#[derive(Debug, Clone)]
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl Biquad {
+    fn identity() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+
+    fn reset(&mut self) {
+        self.x1 = 0.0;
+        self.x2 = 0.0;
+        self.y1 = 0.0;
+        self.y2 = 0.0;
+    }
+}
+
+/// Guadagni EQ in dB per i preset. Ordine: (nome, bassi, medi, alti).
+fn eq_preset_gains(name: &str) -> Option<(f32, f32, f32)> {
+    match name.trim().to_lowercase().as_str() {
+        "flat" | "off" | "neutro" | "normal" => Some((0.0, 0.0, 0.0)),
+        "bass" | "bassi" | "bassboost" => Some((8.0, 1.0, 0.0)),
+        "treble" | "alti" | "trebleboost" => Some((-2.0, 1.0, 7.0)),
+        "pop" => Some((2.0, 4.0, 3.0)),
+        "rock" => Some((5.0, -1.0, 5.0)),
+        "jazz" => Some((4.0, 2.0, 4.0)),
+        "vocal" | "voce" | "voice" | "speech" => Some((-3.0, 4.0, 3.0)),
+        "lofi" => Some((4.0, 1.0, -5.0)),
+        "soft" | "night" | "notte" => Some((-1.0, 0.0, -3.0)),
+        "dance" => Some((6.0, 0.0, 5.0)),
+        _ => None,
+    }
+}
+
+fn eq_preset_list() -> &'static str {
+    "flat, bass, treble, pop, rock, jazz, vocal, lofi, soft, dance"
+}
+
+/// Equalizer completo: 3 biquad + guadagni correnti.
+#[derive(Debug, Clone)]
+struct Eq {
+    bass_db: f32,
+    mid_db: f32,
+    treble_db: f32,
+    low: Biquad,
+    peak: Biquad,
+    high: Biquad,
+}
+
+impl Eq {
+    const SAMPLE_RATE: f32 = 48000.0;
+
+    fn new(bass_db: f32, mid_db: f32, treble_db: f32) -> Self {
+        let mut eq = Self {
+            bass_db: 0.0,
+            mid_db: 0.0,
+            treble_db: 0.0,
+            low: Biquad::identity(),
+            peak: Biquad::identity(),
+            high: Biquad::identity(),
+        };
+        eq.set_gains(bass_db, mid_db, treble_db);
+        eq
+    }
+
+    fn is_flat(&self) -> bool {
+        self.bass_db.abs() < 0.05 && self.mid_db.abs() < 0.05 && self.treble_db.abs() < 0.05
+    }
+
+    fn set_gains(&mut self, bass_db: f32, mid_db: f32, treble_db: f32) {
+        self.bass_db = bass_db.clamp(-12.0, 12.0);
+        self.mid_db = mid_db.clamp(-12.0, 12.0);
+        self.treble_db = treble_db.clamp(-12.0, 12.0);
+        self.low = Self::low_shelf(200.0, self.bass_db);
+        self.peak = Self::peaking(1000.0, 1.0, self.mid_db);
+        self.high = Self::high_shelf(6000.0, self.treble_db);
+    }
+
+    fn reset(&mut self) {
+        self.low.reset();
+        self.peak.reset();
+        self.high.reset();
+    }
+
+    /// Applica l'EQ in place sui sample. No-op se flat.
+    fn apply(&mut self, pcm: &mut [i16]) {
+        if self.is_flat() {
+            return;
+        }
+        for s in pcm.iter_mut() {
+            let x = *s as f32 / 32768.0;
+            let y = self.high.process(self.peak.process(self.low.process(x)));
+            *s = (y * 32768.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
+
+    fn peaking(freq: f32, q: f32, gain_db: f32) -> Biquad {
+        if gain_db.abs() < 0.05 {
+            return Biquad::identity();
+        }
+        let a = 10.0_f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * freq / Self::SAMPLE_RATE;
+        let alpha = w0.sin() / (2.0 * q);
+        let cos_w0 = w0.cos();
+        let b0 = 1.0 + alpha * a;
+        let b1 = -2.0 * cos_w0;
+        let b2 = 1.0 - alpha * a;
+        let a0 = 1.0 + alpha / a;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha / a;
+        Biquad {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    fn low_shelf(freq: f32, gain_db: f32) -> Biquad {
+        if gain_db.abs() < 0.05 {
+            return Biquad::identity();
+        }
+        let a = 10.0_f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * freq / Self::SAMPLE_RATE;
+        let alpha = w0.sin() / 2.0 * std::f32::consts::SQRT_2;
+        let cos_w0 = w0.cos();
+        let sqrt_a = 2.0 * a.sqrt() * alpha;
+        let b0 = a * ((a + 1.0) - (a - 1.0) * cos_w0 + sqrt_a);
+        let b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0);
+        let b2 = a * ((a + 1.0) - (a - 1.0) * cos_w0 - sqrt_a);
+        let a0 = (a + 1.0) + (a - 1.0) * cos_w0 + sqrt_a;
+        let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0);
+        let a2 = (a + 1.0) + (a - 1.0) * cos_w0 - sqrt_a;
+        Biquad {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    fn high_shelf(freq: f32, gain_db: f32) -> Biquad {
+        if gain_db.abs() < 0.05 {
+            return Biquad::identity();
+        }
+        let a = 10.0_f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * freq / Self::SAMPLE_RATE;
+        let alpha = w0.sin() / 2.0 * std::f32::consts::SQRT_2;
+        let cos_w0 = w0.cos();
+        let sqrt_a = 2.0 * a.sqrt() * alpha;
+        let b0 = a * ((a + 1.0) + (a - 1.0) * cos_w0 + sqrt_a);
+        let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0);
+        let b2 = a * ((a + 1.0) + (a - 1.0) * cos_w0 - sqrt_a);
+        let a0 = (a + 1.0) - (a - 1.0) * cos_w0 + sqrt_a;
+        let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos_w0);
+        let a2 = (a + 1.0) - (a - 1.0) * cos_w0 - sqrt_a;
+        Biquad {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Playlist salvate: nome -> lista di URL (video o playlist YouTube).
+// File JSON semplice, es: {"lofi": ["https://..."]}. Modificabile a mano
+// oppure con !playlistsave / !playlistdel direttamente dalla chat.
+// ---------------------------------------------------------------------------
+
+type SavedPlaylists = std::collections::HashMap<String, Vec<String>>;
+
+/// Query di ricerca usata da `!lofi`: niente URL fissi (muoiono in fretta,
+/// es. le live di Lofi Girl cambiano ID), si prendono i primi 5 mix trovati.
+const LOFI_SEARCH: &str = "ytsearch5:lofi hip hop mix";
+
+/// Estrae l'ID video (11 caratteri) da un URL YouTube nei formati comuni.
+fn video_id_from_youtube_url(url: &str) -> Option<&str> {
+    // https://www.youtube.com/watch?v=ID...
+    if let Some(pos) = url.find("v=") {
+        let rest = &url[pos + 2..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+            .unwrap_or(rest.len());
+        let id = &rest[..end];
+        if id.len() == 11 {
+            return Some(id);
+        }
+    }
+    // https://youtu.be/ID, /shorts/ID, /live/ID, /embed/ID
+    for marker in ["youtu.be/", "/shorts/", "/live/", "/embed/"] {
+        if let Some(pos) = url.find(marker) {
+            let rest = &url[pos + marker.len()..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                .unwrap_or(rest.len());
+            let id = &rest[..end];
+            if id.len() == 11 {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Copertina derivata dall'ID video quando yt-dlp non la fornisce
+/// (i risultati flat-playlist/ytsearch riportano "NA", ma le thumbnail
+/// di YouTube seguono un pattern stabile: i.ytimg.com/vi/ID/hqdefault.jpg).
+fn youtube_thumbnail_fallback(page_url: &str) -> Option<String> {
+    video_id_from_youtube_url(page_url)
+        .map(|id| format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))
+}
+
+fn normalize_playlist_name(name: &str) -> String {
+    name.trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}
+
+fn load_playlists(path: &str) -> SavedPlaylists {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(map) => map,
+            Err(e) => {
+                warn!("playlist {path} non valide ({e}), uso vuote");
+                SavedPlaylists::new()
+            }
+        },
+        Err(_) => SavedPlaylists::new(),
+    }
+}
+
+fn save_playlists(path: &str, playlists: &SavedPlaylists) {
+    match serde_json::to_string_pretty(playlists) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(path, json) {
+                warn!("salvataggio playlist {path} fallito: {e}");
+            }
+        }
+        Err(e) => warn!("serializzazione playlist fallita: {e}"),
     }
 }
 
@@ -169,16 +568,25 @@ struct Player {
     /// Pausa: se true, non si legge da ffmpeg né si invia audio
     /// (ffmpeg si blocca da solo per backpressure sulla pipe).
     paused: bool,
+    /// Equalizer a 3 bande (applicato prima del volume).
+    eq: Eq,
+    /// Nome preset EQ attivo ("flat" oppure "custom").
+    eq_preset: String,
+    /// Modalità di ripetizione.
+    loop_mode: LoopMode,
 }
 
 impl Player {
-    fn new(volume: f32) -> Self {
+    fn new(volume: f32, eq: Eq, eq_preset: String, loop_mode: LoopMode) -> Self {
         Self {
             source: Source::Idle,
             queue: VecDeque::new(),
             current: None,
             volume,
             paused: false,
+            eq,
+            eq_preset,
+            loop_mode,
         }
     }
 
@@ -201,15 +609,17 @@ impl Player {
     }
 
     /// Fa partire il brano subito, uccidendo la sorgente precedente.
+    /// L'annuncio include titolo + copertina inline ([img] = preview, non file).
     fn start_track_now(&mut self, track: Track) -> String {
         match spawn_stream(&track.url) {
             Ok(stream) => {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
-                let name = track.display().to_string();
+                let msg = track.announce("Riproduco");
                 self.current = Some(track);
                 self.paused = false;
-                format!("Riproduco: {name}")
+                self.eq.reset();
+                msg
             }
             Err(e) => format!("Play fallito: {e:#}"),
         }
@@ -222,13 +632,36 @@ impl Player {
             Ok(stream) => {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
-                let name = next.display().to_string();
+                let msg = next.announce("Prossimo");
                 self.current = Some(next);
                 self.paused = false;
-                Some(format!("Prossimo: {name}"))
+                self.eq.reset();
+                Some(msg)
             }
             Err(e) => Some(format!("Play fallito per {}: {e:#}", next.display())),
         }
+    }
+
+    /// Fa ripartire il brano corrente (usato dal loop "one").
+    fn restart_current(&mut self) -> Option<String> {
+        let cur = self.current.clone()?;
+        match spawn_stream(&cur.url) {
+            Ok(stream) => {
+                kill_source(&mut self.source);
+                self.source = Source::Stream { stream };
+                self.paused = false;
+                self.eq.reset();
+                Some(cur.announce("Ripeto"))
+            }
+            Err(e) => Some(format!("Replay fallito per {}: {e:#}", cur.display())),
+        }
+    }
+
+    fn eq_summary(&self) -> String {
+        format!(
+            "EQ {} (bass {:+.0}dB, mid {:+.0}dB, treble {:+.0}dB)",
+            self.eq_preset, self.eq.bass_db, self.eq.mid_db, self.eq.treble_db
+        )
     }
 }
 
@@ -326,13 +759,12 @@ fn spawn_stream(url: &str) -> Result<PipeStream> {
     })
 }
 
-/// Risolve un URL in uno o più brani con titolo.
+/// Risolve un URL in uno o più brani con titolo + copertina.
 ///
-/// Usa `yt-dlp --flat-playlist --print "%(title)s ||| %(webpage_url)s"`: se l'URL
-/// è una playlist (o un video con `&list=`), restituisce tutti i brani con titolo;
+/// Usa `yt-dlp --flat-playlist --print "%(title)s ||| %(webpage_url)s ||| %(thumbnail)s"`:
+/// se l'URL è una playlist (o un video con `&list=`), restituisce tutti i brani;
 /// se è un singolo video, restituisce un solo brano. In caso di errore, torna
-/// comunque un brano con l'URL grezzo (titolo sconosciuto) così la riproduzione
-/// parte lo stesso.
+/// comunque un brano con l'URL grezzo così la riproduzione parte lo stesso.
 async fn resolve_tracks(url: String) -> Vec<Track> {
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -342,7 +774,7 @@ async fn resolve_tracks(url: String) -> Vec<Track> {
                 "--no-warnings",
                 "--quiet",
                 "--print",
-                "%(title)s ||| %(webpage_url)s",
+                "%(title)s ||| %(webpage_url)s ||| %(thumbnail)s",
                 &url,
             ])
             .output(),
@@ -356,11 +788,11 @@ async fn resolve_tracks(url: String) -> Vec<Track> {
                 "yt-dlp titolo fallito per {url}: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             );
-            return vec![Track::new(url, None)];
+            return vec![Track::new(url, None, None)];
         }
         _ => {
             warn!("yt-dlp titolo timeout/errore per {url}");
-            return vec![Track::new(url, None)];
+            return vec![Track::new(url, None, None)];
         }
     };
 
@@ -371,20 +803,41 @@ async fn resolve_tracks(url: String) -> Vec<Track> {
         if line.is_empty() {
             continue;
         }
-        if let Some((title, link)) = line.split_once(" ||| ") {
-            let link = link.trim();
-            if link.is_empty() {
-                continue;
-            }
-            tracks.push(Track::new(link.to_string(), Some(title.to_string())));
+        // Formato: "titolo ||| url ||| thumbnail" (thumbnail può mancare/essere "NA").
+        let mut parts = line.splitn(3, " ||| ");
+        let title = parts.next().unwrap_or("").trim();
+        let link = parts.next().unwrap_or("").trim();
+        let thumb = parts.next().unwrap_or("").trim();
+        if link.is_empty() {
+            continue;
         }
+        let thumb = match thumb {
+            "" | "NA" | "none" => youtube_thumbnail_fallback(link),
+            t => Some(t.to_string()),
+        };
+        let title = if title.is_empty() || title == "NA" {
+            None
+        } else {
+            Some(title.to_string())
+        };
+        tracks.push(Track::new(link.to_string(), title, thumb));
     }
     if tracks.is_empty() {
-        vec![Track::new(url, None)]
+        vec![Track::new(url, None, None)]
     } else {
         info!("Risolti {} brani da {url}", tracks.len());
         tracks
     }
+}
+
+/// Risolve una lista di URL (playlist salvata) concatenando i risultati.
+async fn resolve_url_list(urls: Vec<String>) -> Vec<Track> {
+    let mut all = Vec::new();
+    for url in urls {
+        let mut tracks = resolve_tracks(url).await;
+        all.append(&mut tracks);
+    }
+    all
 }
 
 #[tokio::main]
@@ -400,8 +853,19 @@ async fn main() -> Result<()> {
     // Stato persistente: volume + ultimo canale (il --channel esplicito vince).
     let mut saved = BotState::load(&args.state);
     saved.volume = BotState::sanitized_volume(saved.volume);
+    saved.eq_bass = BotState::sanitized_eq_db(saved.eq_bass);
+    saved.eq_mid = BotState::sanitized_eq_db(saved.eq_mid);
+    saved.eq_treble = BotState::sanitized_eq_db(saved.eq_treble);
+    if eq_preset_gains(&saved.eq_preset).is_none() {
+        saved.eq_preset = default_eq_preset();
+    }
+    let loop_mode = LoopMode::parse(&saved.loop_mode).unwrap_or(LoopMode::Off);
+    saved.loop_mode = loop_mode.as_str().to_string();
     if saved.volume != 1.0 {
         info!("Volume ripristinato: {:.0}%", saved.volume * 100.0);
+    }
+    if loop_mode != LoopMode::Off {
+        info!("Loop ripristinato: {}", loop_mode.as_str());
     }
 
     let identity = if std::path::Path::new(&args.identity).exists() {
@@ -451,7 +915,18 @@ async fn main() -> Result<()> {
     let mut encoder = OpusEncoder::new(&audio_cfg)?;
     let mut encode_buf = vec![0u8; 1024];
 
-    let mut player = Player::new(saved.volume);
+    let mut player = Player::new(
+        saved.volume,
+        Eq::new(saved.eq_bass, saved.eq_mid, saved.eq_treble),
+        saved.eq_preset.clone(),
+        loop_mode,
+    );
+    let mut playlists = load_playlists(&args.playlists);
+    if playlists.is_empty() {
+        info!("Nessuna playlist salvata in {}", args.playlists);
+    } else {
+        info!("Caricate {} playlist da {}", playlists.len(), args.playlists);
+    }
     let sample_rate = audio_cfg.sample_rate as f64;
 
     // Risoluzione titoli/playlist in background: `handle_chat` fa solo
@@ -480,6 +955,8 @@ async fn main() -> Result<()> {
                                         &mut player,
                                         &args.state,
                                         &mut saved,
+                                        &args.playlists,
+                                        &mut playlists,
                                         meta_tx.clone(),
                                     ) {
                                         // Risponde nello stesso contesto:
@@ -574,6 +1051,8 @@ async fn main() -> Result<()> {
                 // 2) Streaming audio: un frame Opus ogni 20ms
                 // Se in pausa: non leggiamo da ffmpeg (backpressure = freeze)
                 // e non inviamo audio.
+                // Nota: l'EQ è applicato qui sul PCM (prima di volume+Opus),
+                // quindi il cambio preset è istantaneo senza riavviare lo stream.
                 let vol = player.volume;
                 let paused = player.paused;
                 if paused {
@@ -590,6 +1069,7 @@ async fn main() -> Result<()> {
                             *phase += freq / sample_rate;
                             if *phase >= 1.0 { *phase -= 1.0; }
                         }
+                        player.eq.apply(&mut pcm);
                         apply_volume(&mut pcm, vol);
                         match encoder.encode(&pcm, &mut encode_buf) {
                             Ok(len) => {
@@ -625,13 +1105,40 @@ async fn main() -> Result<()> {
                         }
                         if stream_ended {
                             let finished = player.current_display();
+                            let finished_track = player.current.clone();
                             kill_source(&mut player.source);
                             player.current = None;
-                            // Auto-avanza con la coda, annunciando i titoli
-                            if let Some(msg) = player.start_next() {
-                                let _ = client.send_channel_message(format!("Finito: {finished}\n{msg}"));
-                            } else {
-                                let _ = client.send_channel_message(format!("Finito: {finished}"));
+                            // Loop "one": riparte lo stesso brano.
+                            // Loop "all": il brano finito torna in fondo alla coda.
+                            match player.loop_mode {
+                                LoopMode::One => {
+                                    if let Some(cur) = finished_track {
+                                        player.current = Some(cur);
+                                        if let Some(msg) = player.restart_current() {
+                                            let _ = client.send_channel_message(msg);
+                                        } else if let Some(msg) = player.start_next() {
+                                            let _ = client.send_channel_message(format!("Finito: {finished}\n{msg}"));
+                                        }
+                                    }
+                                }
+                                LoopMode::All => {
+                                    if let Some(cur) = finished_track {
+                                        player.queue.push_back(cur);
+                                    }
+                                    if let Some(msg) = player.start_next() {
+                                        let _ = client.send_channel_message(format!("Finito: {finished}\n{msg}"));
+                                    } else {
+                                        let _ = client.send_channel_message(format!("Finito: {finished}"));
+                                    }
+                                }
+                                LoopMode::Off => {
+                                    // Auto-avanza con la coda, annunciando titolo + cover
+                                    if let Some(msg) = player.start_next() {
+                                        let _ = client.send_channel_message(format!("Finito: {finished}\n{msg}"));
+                                    } else {
+                                        let _ = client.send_channel_message(format!("Finito: {finished}"));
+                                    }
+                                }
                             }
                         } else if stream.pending.len() >= PipeStream::FRAME_BYTES {
                             let raw: Vec<u8> = stream.pending.drain(..PipeStream::FRAME_BYTES).collect();
@@ -639,6 +1146,7 @@ async fn main() -> Result<()> {
                             for (i, s) in pcm.iter_mut().enumerate() {
                                 *s = i16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
                             }
+                            player.eq.apply(&mut pcm);
                             apply_volume(&mut pcm, vol);
                             match encoder.encode(&pcm, &mut encode_buf) {
                                 Ok(len) => {
@@ -660,8 +1168,13 @@ async fn main() -> Result<()> {
     }
 
     kill_source(&mut player.source);
-    // Ricorda volume + canale corrente prima di uscire.
+    // Ricorda volume + EQ + loop + canale corrente prima di uscire.
     saved.volume = player.volume;
+    saved.eq_bass = player.eq.bass_db;
+    saved.eq_mid = player.eq.mid_db;
+    saved.eq_treble = player.eq.treble_db;
+    saved.eq_preset = player.eq_preset.clone();
+    saved.loop_mode = player.loop_mode.as_str().to_string();
     if saved.channel_id != client.channel_id() {
         saved.channel_id = client.channel_id();
         if let Some(id) = saved.channel_id {
@@ -693,6 +1206,8 @@ fn handle_chat(
     player: &mut Player,
     state_path: &str,
     saved: &mut BotState,
+    playlists_path: &str,
+    playlists: &mut SavedPlaylists,
     meta_tx: tokio::sync::mpsc::UnboundedSender<Vec<Track>>,
 ) -> Option<String> {
     let msg = message.trim();
@@ -704,9 +1219,34 @@ fn handle_chat(
     let cmd = parts.next().unwrap_or("").to_lowercase();
     let rest: Vec<&str> = parts.collect();
 
+    /// Applica un preset EQ e lo persiste. Ritorna il messaggio di conferma.
+    fn apply_eq_preset(player: &mut Player, saved: &mut BotState, state_path: &str, name: &str) -> String {
+        match eq_preset_gains(name) {
+            Some((b, m, t)) => {
+                player.eq.set_gains(b, m, t);
+                let canonical = if name.trim().to_lowercase() == "neutro" {
+                    "flat".to_string()
+                } else {
+                    name.trim().to_lowercase()
+                };
+                player.eq_preset = canonical;
+                saved.eq_bass = player.eq.bass_db;
+                saved.eq_mid = player.eq.mid_db;
+                saved.eq_treble = player.eq.treble_db;
+                saved.eq_preset = player.eq_preset.clone();
+                saved.save(state_path);
+                format!("{}.", player.eq_summary())
+            }
+            None => format!(
+                "Preset '{name}' sconosciuto. Disponibili: {}",
+                eq_preset_list()
+            ),
+        }
+    }
+
     match cmd.as_str() {
         "help" => Some(
-            "Comandi: !help !users !channels !join <id|nome> !say <msg> !play <url|hz> !stop !skip !queue !now !volume <0-200> !pause !resume".to_string(),
+            "Comandi: !play <url|hz> !stop !skip !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !playlist <nome> !playlists !join !say !users !channels".to_string(),
         ),
         "users" => {
             let mut users = client.users();
@@ -772,8 +1312,9 @@ fn handle_chat(
                 // Se c'è già uno stream, la sinusoide lo sostituisce (e svuota la coda? no: resta).
                 kill_source(&mut player.source);
                 player.source = Source::Sine { freq: f, phase: 0.0 };
-                player.current = Some(Track::new(format!("sine {f:.0}Hz"), Some(format!("sine {f:.0}Hz"))));
+                player.current = Some(Track::new(format!("sine {f:.0}Hz"), Some(format!("sine {f:.0}Hz")), None));
                 player.paused = false;
+                player.eq.reset();
                 let _ = client.set_input_muted(false);
                 return Some(format!("Riproduzione nota a {f:.0} Hz (OpusMusic). !stop per fermare."));
             }
@@ -838,9 +1379,15 @@ fn handle_chat(
         }
         "now" | "nowplaying" | "np" => {
             let state = if player.paused { " (in pausa)" } else { "" };
+            let extra = format!(
+                "(vol {:.0}%, loop {}, {})",
+                player.volume * 100.0,
+                player.loop_mode.as_str(),
+                player.eq_summary()
+            );
             match &player.current {
-                Some(c) => Some(format!("In riproduzione{state}: {} (vol {:.0}%)", c.display(), player.volume * 100.0)),
-                None => Some(format!("Niente in riproduzione. (vol {:.0}%)", player.volume * 100.0)),
+                Some(c) => Some(format!("{} {extra}", c.announce(&format!("In riproduzione{state}")))),
+                None => Some(format!("Niente in riproduzione. {extra}")),
             }
         }
         "volume" | "vol" => {
@@ -868,6 +1415,308 @@ fn handle_chat(
                 None => Some("Uso: !volume <0-200> (es. !volume 80, !volume +10)".to_string()),
             }
         }
+        "eq" | "equalizer" | "equalizzatore" => {
+            if rest.is_empty() {
+                return Some(format!(
+                    "{}. Uso: !eq <preset|show|list|off>. Preset: {}",
+                    player.eq_summary(),
+                    eq_preset_list()
+                ));
+            }
+            let arg = rest[0].to_lowercase();
+            match arg.as_str() {
+                "show" | "status" | "stato" => Some(format!("{}.", player.eq_summary())),
+                "list" | "lista" | "presets" => {
+                    Some(format!("Preset disponibili: {}", eq_preset_list()))
+                }
+                _ => Some(apply_eq_preset(player, saved, state_path, rest[0])),
+            }
+        }
+        "bass" | "bassi" | "low" => {
+            if rest.is_empty() {
+                return Some(format!(
+                    "Bassi: {:+.0}dB (-12..+12). Uso: !bass <dB> (es. !bass +4)",
+                    player.eq.bass_db
+                ));
+            }
+            match rest[0].replace(',', ".").parse::<f32>() {
+                Ok(db) => {
+                    let db = db.clamp(-12.0, 12.0);
+                    player.eq.set_gains(db, player.eq.mid_db, player.eq.treble_db);
+                    player.eq_preset = "custom".to_string();
+                    saved.eq_bass = player.eq.bass_db;
+                    saved.eq_mid = player.eq.mid_db;
+                    saved.eq_treble = player.eq.treble_db;
+                    saved.eq_preset = "custom".to_string();
+                    saved.save(state_path);
+                    Some(format!("{}.", player.eq_summary()))
+                }
+                Err(_) => Some("Uso: !bass <-12..+12> (es. !bass +4)".to_string()),
+            }
+        }
+        "mid" | "medi" | "medie" => {
+            if rest.is_empty() {
+                return Some(format!(
+                    "Medi: {:+.0}dB (-12..+12). Uso: !mid <dB> (es. !mid -2)",
+                    player.eq.mid_db
+                ));
+            }
+            match rest[0].replace(',', ".").parse::<f32>() {
+                Ok(db) => {
+                    let db = db.clamp(-12.0, 12.0);
+                    player.eq.set_gains(player.eq.bass_db, db, player.eq.treble_db);
+                    player.eq_preset = "custom".to_string();
+                    saved.eq_bass = player.eq.bass_db;
+                    saved.eq_mid = player.eq.mid_db;
+                    saved.eq_treble = player.eq.treble_db;
+                    saved.eq_preset = "custom".to_string();
+                    saved.save(state_path);
+                    Some(format!("{}.", player.eq_summary()))
+                }
+                Err(_) => Some("Uso: !mid <-12..+12> (es. !mid -2)".to_string()),
+            }
+        }
+        "treble" | "alti" | "high" | "alto" => {
+            if rest.is_empty() {
+                return Some(format!(
+                    "Alti: {:+.0}dB (-12..+12). Uso: !treble <dB> (es. !treble +3)",
+                    player.eq.treble_db
+                ));
+            }
+            match rest[0].replace(',', ".").parse::<f32>() {
+                Ok(db) => {
+                    let db = db.clamp(-12.0, 12.0);
+                    player.eq.set_gains(player.eq.bass_db, player.eq.mid_db, db);
+                    player.eq_preset = "custom".to_string();
+                    saved.eq_bass = player.eq.bass_db;
+                    saved.eq_mid = player.eq.mid_db;
+                    saved.eq_treble = player.eq.treble_db;
+                    saved.eq_preset = "custom".to_string();
+                    saved.save(state_path);
+                    Some(format!("{}.", player.eq_summary()))
+                }
+                Err(_) => Some("Uso: !treble <-12..+12> (es. !treble +3)".to_string()),
+            }
+        }
+        "loop" | "repeat" | "ripeti" | "replay-mode" => {
+            if rest.is_empty() {
+                // Senza argomento: cicla off -> all -> one -> off.
+                player.loop_mode = match player.loop_mode {
+                    LoopMode::Off => LoopMode::All,
+                    LoopMode::All => LoopMode::One,
+                    LoopMode::One => LoopMode::Off,
+                };
+            } else if let Some(m) = LoopMode::parse(rest[0]) {
+                player.loop_mode = m;
+            } else {
+                return Some("Uso: !loop [off|all|one] (off=spento, all=tutta la coda, one=brano corrente)".to_string());
+            }
+            saved.loop_mode = player.loop_mode.as_str().to_string();
+            saved.save(state_path);
+            let desc = match player.loop_mode {
+                LoopMode::Off => "Loop disattivato.",
+                LoopMode::All => "Loop attivo: tutta la coda (alla fine il brano torna in fondo).",
+                LoopMode::One => "Loop attivo: ripeto il brano corrente.",
+            };
+            Some(desc.to_string())
+        }
+        "lofi" | "radio" | "chill" => {
+            // Niente URL fisso (le live muoiono/girano ID): cerca 5 mix lofi
+            // e li accoda come una mini-playlist. Con !loop all girano a ripetizione.
+            let _ = client.set_input_muted(false);
+            let tx = meta_tx.clone();
+            tokio::spawn(async move {
+                let tracks = resolve_tracks(LOFI_SEARCH.to_string()).await;
+                let _ = tx.send(tracks);
+            });
+            Some("Caricamento lofi... (5 mix in arrivo, poi !loop all per ripeterli)".to_string())
+        }
+        "playlists" | "playlist-list" => {
+            if playlists.is_empty() {
+                Some("Nessuna playlist salvata. Uso: !playlistsave <nome> per salvare coda+corrente.".to_string())
+            } else {
+                let mut names: Vec<&String> = playlists.keys().collect();
+                names.sort();
+                let mut out = format!("Playlist salvate ({}):\n", names.len());
+                for n in names {
+                    let count = playlists.get(n).map(|v| v.len()).unwrap_or(0);
+                    out.push_str(&format!("- {n} ({count} voci)\n"));
+                }
+                out.push_str("Uso: !playlist <nome>");
+                Some(out)
+            }
+        }
+        "playlist" => {
+            if rest.is_empty() {
+                return Some("Uso: !playlist <nome> (vedi !playlists)".to_string());
+            }
+            let name = normalize_playlist_name(rest[0]);
+            if name.is_empty() {
+                return Some("Nome playlist non valido (usa lettere/numeri/-/_.".to_string());
+            }
+            let urls = match playlists.get(&name) {
+                Some(u) if !u.is_empty() => u.clone(),
+                _ => return Some(format!("Playlist '{name}' non trovata o vuota. Vedi !playlists.")),
+            };
+            let n = urls.len();
+            let _ = client.set_input_muted(false);
+            let tx = meta_tx.clone();
+            tokio::spawn(async move {
+                let tracks = resolve_url_list(urls).await;
+                let _ = tx.send(tracks);
+            });
+            Some(format!("Caricamento playlist '{name}' ({n} voci)..."))
+        }
+        "playlistsave" | "playlist-save" | "saveplaylist" => {
+            if rest.is_empty() {
+                return Some("Uso: !playlistsave <nome> (salva brano corrente + coda)".to_string());
+            }
+            let name = normalize_playlist_name(rest[0]);
+            if name.is_empty() {
+                return Some("Nome playlist non valido (usa lettere/numeri/-/_.".to_string());
+            }
+            let mut urls: Vec<String> = Vec::new();
+            if let Some(cur) = &player.current {
+                if is_url(&cur.url) {
+                    urls.push(cur.url.clone());
+                }
+            }
+            for t in &player.queue {
+                if is_url(&t.url) {
+                    urls.push(t.url.clone());
+                }
+            }
+            if urls.is_empty() {
+                return Some("Niente da salvare: né corrente né coda contengono URL.".to_string());
+            }
+            urls.dedup();
+            let count = urls.len();
+            playlists.insert(name.clone(), urls);
+            save_playlists(playlists_path, playlists);
+            Some(format!("Playlist '{name}' salvata ({count} voci). Caricala con !playlist {name}."))
+        }
+        "playlistdel" | "playlist-del" | "delplaylist" | "playlistrm" => {
+            if rest.is_empty() {
+                return Some("Uso: !playlistdel <nome>".to_string());
+            }
+            let name = normalize_playlist_name(rest[0]);
+            if playlists.remove(&name).is_some() {
+                save_playlists(playlists_path, playlists);
+                Some(format!("Playlist '{name}' eliminata."))
+            } else {
+                Some(format!("Playlist '{name}' non trovata."))
+            }
+        }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eq_presets_all_known() {
+        for name in [
+            "flat", "off", "bass", "treble", "pop", "rock", "jazz", "vocal", "lofi",
+            "soft", "dance",
+        ] {
+            assert!(eq_preset_gains(name).is_some(), "preset mancante: {name}");
+        }
+        assert!(eq_preset_gains("inesistente").is_none());
+    }
+
+    #[test]
+    fn eq_flat_is_noop() {
+        let mut eq = Eq::new(0.0, 0.0, 0.0);
+        let mut pcm = vec![1000i16, -2000, 3000, -4000];
+        let before = pcm.clone();
+        eq.apply(&mut pcm);
+        assert_eq!(pcm, before);
+    }
+
+    #[test]
+    fn eq_bass_boosts_low_sine() {
+        // Seno a 100Hz: con +10dB sui bassi l'RMS deve crescere nettamente.
+        let make_sine = || {
+            (0..4800)
+                .map(|i| {
+                    (i as f32 * 2.0 * std::f32::consts::PI * 100.0 / 48000.0).sin() * 10000.0
+                        as f32
+                })
+                .map(|v| v as i16)
+                .collect::<Vec<_>>()
+        };
+        let rms = |pcm: &[i16]| {
+            (pcm.iter().map(|s| (*s as f32).powi(2)).sum::<f32>() / pcm.len() as f32).sqrt()
+        };
+        let dry = make_sine();
+        let dry_rms = rms(&dry);
+        let mut wet = dry.clone();
+        Eq::new(10.0, 0.0, 0.0).apply(&mut wet);
+        assert!(rms(&wet) > dry_rms * 1.5, "boost bassi troppo debole");
+    }
+
+    #[test]
+    fn eq_gains_clamped() {
+        let eq = Eq::new(99.0, -99.0, 0.5);
+        assert_eq!(eq.bass_db, 12.0);
+        assert_eq!(eq.mid_db, -12.0);
+    }
+
+    #[test]
+    fn track_announce_embeds_cover_preview() {
+        let t = Track::new(
+            "https://youtu.be/x".to_string(),
+            Some("Titolo".to_string()),
+            Some("https://i.ytimg.com/vi/x/hqdefault.jpg".to_string()),
+        );
+        let msg = t.announce("Riproduco");
+        assert!(msg.contains("[img]https://i.ytimg.com/vi/x/hqdefault.jpg[/img]"));
+        assert!(msg.contains("[b]"));
+        let plain = Track::new("https://youtu.be/x".to_string(), None, None);
+        assert!(!plain.announce("Riproduco").contains("[img]"));
+        assert!(plain.display() == "https://youtu.be/x");
+    }
+
+    #[test]
+    fn loop_mode_parse() {
+        assert_eq!(LoopMode::parse("off"), Some(LoopMode::Off));
+        assert_eq!(LoopMode::parse("ONE"), Some(LoopMode::One));
+        assert_eq!(LoopMode::parse("all"), Some(LoopMode::All));
+        assert_eq!(LoopMode::parse("ciao"), None);
+    }
+
+    #[test]
+    fn playlist_name_normalized() {
+        assert_eq!(normalize_playlist_name(" LoFi-2024! "), "lofi-2024");
+    }
+
+    #[test]
+    fn youtube_thumbnail_fallback_from_watch_url() {
+        let thumb = youtube_thumbnail_fallback("https://www.youtube.com/watch?v=n61ULEU7CO0");
+        assert_eq!(
+            thumb.as_deref(),
+            Some("https://i.ytimg.com/vi/n61ULEU7CO0/hqdefault.jpg")
+        );
+        // Con parametri extra dopo l'ID.
+        let thumb = youtube_thumbnail_fallback("https://www.youtube.com/watch?v=n61ULEU7CO0&list=PLx");
+        assert!(thumb.is_some());
+        // Formati corti.
+        assert!(youtube_thumbnail_fallback("https://youtu.be/n61ULEU7CO0").is_some());
+        assert!(youtube_thumbnail_fallback("https://www.youtube.com/shorts/n61ULEU7CO0").is_some());
+        // Non-YouTube: niente fallback.
+        assert!(youtube_thumbnail_fallback("https://example.com/audio.mp3").is_none());
+    }
+
+    #[test]
+    fn track_without_thumbnail_still_announces() {
+        let t = Track::new(
+            "https://example.com/x.mp3".to_string(),
+            Some("Brano".to_string()),
+            Some("NA".to_string()),
+        );
+        assert!(t.thumbnail.is_none());
+        assert!(t.announce("Riproduco").contains("Brano"));
     }
 }
