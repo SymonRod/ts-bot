@@ -895,9 +895,29 @@ async fn main() -> Result<()> {
     }
     let config = cfg.build()?;
 
-    info!("Connessione a {}...", args.server);
-    let mut client = Client::connect(config)?;
-    client.wait_connected().await?;
+    // Retry con backoff esponenziale: un exit immediato + restart di Docker
+    // martella il server e fa scattare il ban anti-flood (ConnectFailedBanned).
+    let mut client = {
+        let mut delay = tokio::time::Duration::from_secs(5);
+        let max_delay = tokio::time::Duration::from_secs(300);
+        loop {
+            info!("Connessione a {}...", args.server);
+            let attempt: Result<Client> = async {
+                let mut c = Client::connect(config.clone())?;
+                c.wait_connected().await?;
+                Ok(c)
+            }
+            .await;
+            match attempt {
+                Ok(c) => break c,
+                Err(e) => {
+                    warn!("Connessione fallita: {e:#}. Riprovo tra {}s", delay.as_secs());
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(max_delay);
+                }
+            }
+        }
+    };
     info!("Connesso! Comandi con prefisso '{}'", args.prefix);
 
     // Mostra microfono come NON mutato così gli altri vedono l'icona corretta
