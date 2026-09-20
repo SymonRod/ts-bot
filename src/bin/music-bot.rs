@@ -8,11 +8,11 @@
 //!
 //! Uso:
 //!   cargo run --bin music-bot -- --server god.serod.tech:9988 --nickname MusicBot
-//! Requisiti host per !play <url>: binari `yt-dlp` e `ffmpeg` installati.
+//! Requisiti host per !play <url|ricerca>: binari `yt-dlp` e `ffmpeg` installati.
 //!
 //! Comandi in chat:
 //!   !help, !users, !channels, !join <id|nome>, !say <msg>,
-//!   !play <url|hz>, !stop, !skip, !queue, !now, !volume <0-200>,
+//!   !play <url|ricerca|hz>, !stop, !skip, !queue, !now, !volume <0-200>,
 //!   !pause, !resume, !eq <preset|show|list>, !bass/!mid/!treble <-12..+12>,
 //!   !loop [off|one|all], !lofi, !playlist <nome>, !playlists,
 //!   !playlistsave <nome>, !playlistdel <nome>
@@ -464,6 +464,17 @@ type SavedPlaylists = std::collections::HashMap<String, Vec<String>>;
 /// es. le live di Lofi Girl cambiano ID), si prendono i primi 5 mix trovati.
 const LOFI_SEARCH: &str = "ytsearch5:lofi hip hop mix";
 
+/// Spec di ricerca YouTube per yt-dlp: `!play awake and alive` diventa
+/// `ytsearch1:awake and alive`, cioè il primo risultato della ricerca.
+fn youtube_search_spec(query: &str) -> String {
+    format!("ytsearch1:{query}")
+}
+
+/// true se la stringa è una spec di ricerca yt-dlp (`ytsearch...:`) e non un URL.
+fn is_search_spec(s: &str) -> bool {
+    s.starts_with("ytsearch")
+}
+
 /// Estrae l'ID video (11 caratteri) da un URL YouTube nei formati comuni.
 fn video_id_from_youtube_url(url: &str) -> Option<&str> {
     // https://www.youtube.com/watch?v=ID...
@@ -763,8 +774,14 @@ fn spawn_stream(url: &str) -> Result<PipeStream> {
 ///
 /// Usa `yt-dlp --flat-playlist --print "%(title)s ||| %(webpage_url)s ||| %(thumbnail)s"`:
 /// se l'URL è una playlist (o un video con `&list=`), restituisce tutti i brani;
-/// se è un singolo video, restituisce un solo brano. In caso di errore, torna
-/// comunque un brano con l'URL grezzo così la riproduzione parte lo stesso.
+/// se è un singolo video, restituisce un solo brano.
+///
+/// Accetta anche una spec di ricerca (`ytsearch1:awake and alive`): in quel caso
+/// yt-dlp restituisce i risultati della ricerca YouTube.
+///
+/// In caso di errore torna comunque un brano con l'URL grezzo così la
+/// riproduzione parte lo stesso; per una ricerca invece torna vuoto, perché
+/// la spec `ytsearch...` non è riproducibile da `spawn_stream`.
 async fn resolve_tracks(url: String) -> Vec<Track> {
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -788,11 +805,11 @@ async fn resolve_tracks(url: String) -> Vec<Track> {
                 "yt-dlp titolo fallito per {url}: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             );
-            return vec![Track::new(url, None, None)];
+            return fallback_tracks(url);
         }
         _ => {
             warn!("yt-dlp titolo timeout/errore per {url}");
-            return vec![Track::new(url, None, None)];
+            return fallback_tracks(url);
         }
     };
 
@@ -823,10 +840,20 @@ async fn resolve_tracks(url: String) -> Vec<Track> {
         tracks.push(Track::new(link.to_string(), title, thumb));
     }
     if tracks.is_empty() {
-        vec![Track::new(url, None, None)]
+        fallback_tracks(url)
     } else {
         info!("Risolti {} brani da {url}", tracks.len());
         tracks
+    }
+}
+
+/// Fallback quando yt-dlp non risolve: l'URL grezzo si può comunque provare
+/// a riprodurre, una ricerca senza risultati no.
+fn fallback_tracks(url: String) -> Vec<Track> {
+    if is_search_spec(&url) {
+        Vec::new()
+    } else {
+        vec![Track::new(url, None, None)]
     }
 }
 
@@ -1024,6 +1051,9 @@ async fn main() -> Result<()> {
                 // 1b) Brani risolti in background (titoli/playlist via yt-dlp)
                 while let Ok(tracks) = meta_rx.try_recv() {
                     if tracks.is_empty() {
+                        let _ = client.send_channel_message(
+                            "Nessun risultato trovato.".to_string(),
+                        );
                         continue;
                     }
                     let n = tracks.len();
@@ -1266,7 +1296,7 @@ fn handle_chat(
 
     match cmd.as_str() {
         "help" => Some(
-            "Comandi: !play <url|hz> !stop !skip !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !playlist <nome> !playlists !join !say !users !channels".to_string(),
+            "Comandi: !play <url|ricerca|hz> !stop !skip !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !playlist <nome> !playlists !join !say !users !channels".to_string(),
         ),
         "users" => {
             let mut users = client.users();
@@ -1321,7 +1351,10 @@ fn handle_chat(
         }
         "play" => {
             if rest.is_empty() {
-                return Some("Uso: !play <url YouTube> oppure !play [hz 50-2000]".to_string());
+                return Some(
+                    "Uso: !play <url YouTube | titolo da cercare> oppure !play [hz 50-2000]"
+                        .to_string(),
+                );
             }
             let arg = rest[0];
             // Frequenza numerica = demo sinusoide (retrocompatibile)
@@ -1338,19 +1371,25 @@ fn handle_chat(
                 let _ = client.set_input_muted(false);
                 return Some(format!("Riproduzione nota a {f:.0} Hz (OpusMusic). !stop per fermare."));
             }
-            // Altrimenti URL: risolvi titolo/playlist in background per non
-            // bloccare il tick audio da 20ms. L'annuncio col titolo arriva in canale.
-            let url = arg.to_string();
-            if !is_url(&url) {
-                return Some("Uso: !play <url YouTube> oppure !play [hz 50-2000]".to_string());
-            }
+            // Altrimenti URL, oppure testo libero = ricerca su YouTube.
+            // Risolviamo in background per non bloccare il tick audio da 20ms:
+            // l'annuncio col titolo arriva in canale.
+            let query = rest.join(" ");
+            let (spec, loading) = if is_url(arg) {
+                (arg.to_string(), "Caricamento... (risolvo titolo/playlist)".to_string())
+            } else {
+                (
+                    youtube_search_spec(&query),
+                    format!("Cerco su YouTube: {query}..."),
+                )
+            };
             let _ = client.set_input_muted(false);
             let tx = meta_tx.clone();
             tokio::spawn(async move {
-                let tracks = resolve_tracks(url).await;
+                let tracks = resolve_tracks(spec).await;
                 let _ = tx.send(tracks);
             });
-            Some("Caricamento... (risolvo titolo/playlist)".to_string())
+            Some(loading)
         }
         "stop" => {
             player.stop_all();
