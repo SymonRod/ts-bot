@@ -14,8 +14,8 @@
 //!   !help, !users, !channels, !join <id|nome>, !say <msg>,
 //!   !play <url|ricerca|hz>, !stop, !skip, !queue, !now, !volume <0-200>,
 //!   !pause, !resume, !eq <preset|show|list>, !bass/!mid/!treble <-12..+12>,
-//!   !loop [off|one|all], !lofi, !playlist <nome>, !playlists,
-//!   !playlistsave <nome>, !playlistdel <nome>
+//!   !loop [off|one|all], !lofi, !ytplaylist <ricerca>, !playlist <nome>, !playlists,
+//!   !playlistsave <nome> [url...], !playlistdel <nome>
 
 use std::collections::VecDeque;
 use std::process::Stdio;
@@ -867,6 +867,83 @@ async fn resolve_url_list(urls: Vec<String>) -> Vec<Track> {
     all
 }
 
+/// Brani risolti in background e inviati al main loop. `label` (es. il titolo
+/// della playlist YouTube trovata) viene mostrato nell'annuncio in canale.
+struct Resolved {
+    tracks: Vec<Track>,
+    label: Option<String>,
+}
+
+impl Resolved {
+    fn plain(tracks: Vec<Track>) -> Self {
+        Self { tracks, label: None }
+    }
+}
+
+/// URL di ricerca YouTube filtrata sulle sole playlist (`sp=EgIQAw==`):
+/// yt-dlp non ha un prefisso tipo `ytsearch` per le playlist.
+fn youtube_playlist_search_url(query: &str) -> String {
+    let mut q = String::new();
+    for b in query.trim().bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                q.push(b as char)
+            }
+            b' ' => q.push('+'),
+            _ => q.push_str(&format!("%{b:02X}")),
+        }
+    }
+    format!("https://www.youtube.com/results?search_query={q}&sp=EgIQAw%3D%3D")
+}
+
+/// Prima playlist YouTube che corrisponde a `query`: (titolo, URL playlist).
+async fn find_youtube_playlist(query: &str) -> Option<(String, String)> {
+    let search_url = youtube_playlist_search_url(query);
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::process::Command::new("yt-dlp")
+            .args([
+                "--flat-playlist",
+                "--no-warnings",
+                "--quiet",
+                "--playlist-items",
+                "1",
+                "--print",
+                "%(title)s ||| %(url)s",
+                &search_url,
+            ])
+            .output(),
+    )
+    .await;
+
+    let output = match out {
+        Ok(Ok(o)) if o.status.success() => o,
+        Ok(Ok(o)) => {
+            warn!(
+                "yt-dlp ricerca playlist fallita per '{query}': {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return None;
+        }
+        _ => {
+            warn!("yt-dlp ricerca playlist timeout/errore per '{query}'");
+            return None;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let mut parts = line.splitn(2, " ||| ");
+    let title = parts.next().unwrap_or("").trim();
+    let link = parts.next().unwrap_or("").trim();
+    if !link.contains("list=") {
+        return None;
+    }
+    let title = if title.is_empty() || title == "NA" { link } else { title };
+    info!("Playlist trovata per '{query}': {title} ({link})");
+    Some((title.to_string(), link.to_string()))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder()
@@ -979,7 +1056,7 @@ async fn main() -> Result<()> {
     // Risoluzione titoli/playlist in background: `handle_chat` fa solo
     // `tokio::spawn(resolve_tracks(url))` e risponde subito "Caricamento...",
     // così il tick audio da 20ms non si blocca. I risultati arrivano qui.
-    let (meta_tx, mut meta_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Track>>();
+    let (meta_tx, mut meta_rx) = tokio::sync::mpsc::unbounded_channel::<Resolved>();
 
     let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(20));
 
@@ -1049,7 +1126,7 @@ async fn main() -> Result<()> {
                 }
 
                 // 1b) Brani risolti in background (titoli/playlist via yt-dlp)
-                while let Ok(tracks) = meta_rx.try_recv() {
+                while let Ok(Resolved { tracks, label }) = meta_rx.try_recv() {
                     if tracks.is_empty() {
                         let _ = client.send_channel_message(
                             "Nessun risultato trovato.".to_string(),
@@ -1057,6 +1134,10 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     let n = tracks.len();
+                    // Titolo della playlist trovata con !ytplaylist, se presente.
+                    let pl_name = label
+                        .map(|l| format!("Playlist '{l}'"))
+                        .unwrap_or_else(|| "Playlist".to_string());
                     if player.is_busy() {
                         // C'è già qualcosa in riproduzione: accoda tutto.
                         let first = tracks[0].display().to_string();
@@ -1070,7 +1151,7 @@ async fn main() -> Result<()> {
                             ));
                         } else {
                             let _ = client.send_channel_message(format!(
-                                "Playlist: aggiunti {n} brani in coda (tot. {}). Primo: {first}",
+                                "{pl_name}: aggiunti {n} brani in coda (tot. {}). Primo: {first}",
                                 player.queue.len(),
                                 first = first
                             ));
@@ -1088,7 +1169,7 @@ async fn main() -> Result<()> {
                         let _ = client.set_input_muted(false);
                         if rest_n > 0 {
                             let _ = client.send_channel_message(format!(
-                                "Playlist: {rest_n_plus} brani in coda.\n{msg}",
+                                "{pl_name}: {rest_n_plus} brani in coda.\n{msg}",
                                 rest_n_plus = rest_n + 1,
                                 msg = msg
                             ));
@@ -1258,7 +1339,7 @@ fn handle_chat(
     saved: &mut BotState,
     playlists_path: &str,
     playlists: &mut SavedPlaylists,
-    meta_tx: tokio::sync::mpsc::UnboundedSender<Vec<Track>>,
+    meta_tx: tokio::sync::mpsc::UnboundedSender<Resolved>,
 ) -> Option<String> {
     let msg = message.trim();
     if !msg.starts_with(prefix) {
@@ -1296,7 +1377,7 @@ fn handle_chat(
 
     match cmd.as_str() {
         "help" => Some(
-            "Comandi: !play <url|ricerca|hz> !stop !skip !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !playlist <nome> !playlists !join !say !users !channels".to_string(),
+            "Comandi: !play <url|ricerca|hz> !stop !skip !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !ytplaylist <ricerca> !playlist <nome> !playlists !join !say !users !channels".to_string(),
         ),
         "users" => {
             let mut users = client.users();
@@ -1387,7 +1468,7 @@ fn handle_chat(
             let tx = meta_tx.clone();
             tokio::spawn(async move {
                 let tracks = resolve_tracks(spec).await;
-                let _ = tx.send(tracks);
+                let _ = tx.send(Resolved::plain(tracks));
             });
             Some(loading)
         }
@@ -1586,9 +1667,31 @@ fn handle_chat(
             let tx = meta_tx.clone();
             tokio::spawn(async move {
                 let tracks = resolve_tracks(LOFI_SEARCH.to_string()).await;
-                let _ = tx.send(tracks);
+                let _ = tx.send(Resolved::plain(tracks));
             });
             Some("Caricamento lofi... (5 mix in arrivo, poi !loop all per ripeterli)".to_string())
+        }
+        "ytplaylist" | "ytpl" | "searchplaylist" | "cercaplaylist" => {
+            if rest.is_empty() {
+                return Some("Uso: !ytplaylist <titolo playlist da cercare su YouTube>".to_string());
+            }
+            // Cerca la prima playlist YouTube per titolo e la carica come
+            // un !play <url playlist>: il primo brano parte, il resto va in coda.
+            let query = rest.join(" ");
+            let _ = client.set_input_muted(false);
+            let tx = meta_tx.clone();
+            let q = query.clone();
+            tokio::spawn(async move {
+                let resolved = match find_youtube_playlist(&q).await {
+                    Some((title, url)) => Resolved {
+                        tracks: resolve_tracks(url).await,
+                        label: Some(title),
+                    },
+                    None => Resolved::plain(Vec::new()),
+                };
+                let _ = tx.send(resolved);
+            });
+            Some(format!("Cerco playlist su YouTube: {query}..."))
         }
         "playlists" | "playlist-list" => {
             if playlists.is_empty() {
@@ -1622,17 +1725,39 @@ fn handle_chat(
             let tx = meta_tx.clone();
             tokio::spawn(async move {
                 let tracks = resolve_url_list(urls).await;
-                let _ = tx.send(tracks);
+                let _ = tx.send(Resolved::plain(tracks));
             });
             Some(format!("Caricamento playlist '{name}' ({n} voci)..."))
         }
         "playlistsave" | "playlist-save" | "saveplaylist" => {
             if rest.is_empty() {
-                return Some("Uso: !playlistsave <nome> (salva brano corrente + coda)".to_string());
+                return Some(
+                    "Uso: !playlistsave <nome> [url] (con url salva quel link/playlist YouTube, senza salva brano corrente + coda)"
+                        .to_string(),
+                );
             }
             let name = normalize_playlist_name(rest[0]);
             if name.is_empty() {
                 return Some("Nome playlist non valido (usa lettere/numeri/-/_.".to_string());
+            }
+            // Con URL espliciti si salvano i link così come sono: una playlist
+            // YouTube viene espansa da yt-dlp a ogni !playlist, quindi resta
+            // allineata ai brani aggiunti/rimossi su YouTube.
+            let explicit: Vec<String> = rest[1..]
+                .iter()
+                .filter(|u| is_url(u))
+                .map(|u| u.to_string())
+                .collect();
+            if rest.len() > 1 && explicit.len() != rest.len() - 1 {
+                return Some("Dopo il nome sono ammessi solo URL (http/https).".to_string());
+            }
+            if !explicit.is_empty() {
+                let count = explicit.len();
+                playlists.insert(name.clone(), explicit);
+                save_playlists(playlists_path, playlists);
+                return Some(format!(
+                    "Playlist '{name}' salvata ({count} link). Caricala con !playlist {name}."
+                ));
             }
             let mut urls: Vec<String> = Vec::new();
             if let Some(cur) = &player.current {
@@ -1766,6 +1891,17 @@ mod tests {
         assert!(youtube_thumbnail_fallback("https://www.youtube.com/shorts/n61ULEU7CO0").is_some());
         // Non-YouTube: niente fallback.
         assert!(youtube_thumbnail_fallback("https://example.com/audio.mp3").is_none());
+    }
+
+    #[test]
+    fn playlist_search_url_encodes_query() {
+        assert_eq!(
+            youtube_playlist_search_url(" lofi hip hop "),
+            "https://www.youtube.com/results?search_query=lofi+hip+hop&sp=EgIQAw%3D%3D"
+        );
+        // Caratteri speciali/accentati percent-encoded (UTF-8), niente '&' grezzi.
+        let url = youtube_playlist_search_url("città & mare");
+        assert!(url.contains("search_query=citt%C3%A0+%26+mare&"));
     }
 
     #[test]
