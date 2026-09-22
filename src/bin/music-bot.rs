@@ -95,6 +95,12 @@ struct Args {
     /// interfacce, bridge Docker compresi.
     #[arg(long)]
     video_bind: Option<String>,
+
+    /// Apre la condivisione video all'avvio, senza aspettare un !video on
+    /// (in Docker: TS_VIDEO_AUTO=1). Un !video off la spegne comunque, fino
+    /// al riavvio successivo.
+    #[arg(long)]
+    video_auto: bool,
 }
 
 /// Stato persistente tra riavvii: volume, EQ, loop e ultimo canale joinato.
@@ -592,7 +598,9 @@ enum Source {
 
 /// Processo yt-dlp -> ffmpeg con stdout PCM s16le mono 48kHz da leggere a frame.
 struct PipeStream {
-    ytdlp: tokio::process::Child,
+    /// Assente quando si riparte da un seek: lì ffmpeg apre la URL diretta
+    /// da solo, senza yt-dlp a monte nella pipe.
+    ytdlp: Option<tokio::process::Child>,
     ffmpeg: tokio::process::Child,
     stdout: tokio::process::ChildStdout,
     /// Buffer di accumulo: ffmpeg produce più in fretta del realtime,
@@ -618,6 +626,9 @@ struct Video {
     idle_since: Option<Instant>,
     /// In onda c'è l'animazione di attesa, non un video.
     showing_idle: bool,
+    /// Ultimo avvio dell'animazione di attesa, per non riprovare a raffica
+    /// quando ffmpeg la rifiuta.
+    idle_started: Option<Instant>,
     /// Assegnato dal server dopo `setupstream`: finché è `None` le richieste
     /// dei viewer non si possono accettare.
     stream_id: Option<String>,
@@ -635,6 +646,8 @@ impl Video {
     const MAX_NAME_CHARS: usize = 40;
     /// Quanto resta aperta la live senza brani prima di chiudersi.
     const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+    /// Ogni quanto riprovare l'animazione di attesa se non parte.
+    const IDLE_RETRY: Duration = Duration::from_secs(5);
 
     fn new(config: &BroadcastConfig) -> Self {
         Self {
@@ -642,6 +655,7 @@ impl Video {
             open: false,
             idle_since: None,
             showing_idle: false,
+            idle_started: None,
             stream_id: None,
             hold_audio_until: None,
             pending_name: None,
@@ -655,11 +669,12 @@ impl Video {
             warn!("animazione di attesa non avviata: {e}");
         }
         self.showing_idle = true;
+        self.idle_started = Some(Instant::now());
     }
 
-    fn play(&mut self, track: &Track, height: u32) {
+    fn play(&mut self, track: &Track, height: u32, at: Duration) {
         self.showing_idle = false;
-        match self.broadcaster.play(VideoInput::Command(ytdlp_video_command(&track.url, height))) {
+        match self.broadcaster.play(VideoInput::Command(ytdlp_video_command(&track.url, height, at))) {
             Ok(()) => self.hold_audio_until = Some(Instant::now() + Self::MAX_AUDIO_HOLD),
             Err(e) => {
                 warn!("video non avviato: {e}");
@@ -695,8 +710,11 @@ fn idle_animation(height: u32, countdown: Option<Duration>) -> String {
     let (vx, vy) = (px(90), px(70));
     let bounces = format!("floor(t*{vx}/{})+floor(t*{vy}/{})", w - lw, h - lh);
 
+    // `speed` sta fermo sul minimo, non a zero: ffmpeg 5.1 (Debian bookworm,
+    // l'immagine del bot) rifiuta 0 con "out of range [1e-05 - 1]" e il grafo
+    // non parte affatto. A muovere le tinte ci pensa il `hue` qui sotto.
     let mut graph = format!(
-        "gradients=s={w}x{h}:r=30:c0=0x0f0c29:c1=0x302b63:c2=0x24243e:c3=0x6a3093:nb_colors=4:speed=0:type=radial:x0={cx}:y0={cy}:x1=0:y1=0,\
+        "gradients=s={w}x{h}:r=30:c0=0x0f0c29:c1=0x302b63:c2=0x24243e:c3=0x6a3093:nb_colors=4:speed=0.00001:type=radial:x0={cx}:y0={cy}:x1=0:y1=0,\
          hue=h='40*sin(2*PI*t/20)'",
         cx = w / 2,
         cy = h / 2,
@@ -740,18 +758,27 @@ fn idle_animation(height: u32, countdown: Option<Duration>) -> String {
 
 /// `yt-dlp` con lo stream solo-video, su stdout. Preferisce H.264 (decodifica
 /// leggera) entro l'altezza richiesta; il ricodificare in VP8 lo fa tslib-stream.
-fn ytdlp_video_command(url: &str, height: u32) -> std::process::Command {
-    let mut cmd = std::process::Command::new("yt-dlp");
-    cmd.args([
-        "-f",
-        &format!("bv*[height<={height}][vcodec^=avc1]/bv*[height<={height}]/b[height<={height}]/b"),
-        "-o",
-        "-",
-        "--no-playlist",
-        "--quiet",
-        "--no-warnings",
-        url,
-    ]);
+///
+/// Con `at` > 0 (seek) è ffmpeg ad aprire la URL diretta (`yt-dlp -g`) e a
+/// posizionarsi con `-ss`, rigirando il flusso in matroska senza ricodificare:
+/// tslib-stream riceve un input già posizionato, come per l'audio. Sulla pipe
+/// il seek non funzionerebbe: l'MP4 di YouTube non è demuxabile all'indietro.
+fn ytdlp_video_command(url: &str, height: u32, at: Duration) -> std::process::Command {
+    let format = format!("bv*[height<={height}][vcodec^=avc1]/bv*[height<={height}]/b[height<={height}]/b");
+    if at.is_zero() {
+        let mut cmd = std::process::Command::new("yt-dlp");
+        cmd.args(["-f", &format, "-o", "-", "--no-playlist", "--quiet", "--no-warnings", url]);
+        return cmd;
+    }
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(format!(
+        "exec ffmpeg -hide_banner -loglevel error -ss {ss:.3} \
+         -i \"$(yt-dlp -f {format} -g --no-playlist --quiet --no-warnings {url})\" \
+         -c copy -f matroska pipe:1",
+        ss = at.as_secs_f64(),
+        format = shell_quote(&format),
+        url = shell_quote(url),
+    ));
     cmd
 }
 
@@ -780,6 +807,10 @@ struct Player {
     /// brano suonava: a fine brano non va ripetuto né rimesso in coda dal loop,
     /// si passa direttamente alla nuova playlist.
     current_replaced: bool,
+    /// Quanto del brano corrente è già stato riprodotto: i frame emessi da
+    /// 20ms più l'eventuale punto di partenza di un seek. Base di !avanti,
+    /// !indietro e !seek.
+    position: Duration,
     /// Condivisione video, se attiva (!video on).
     video: Option<Video>,
     /// Configurazione con cui aprire la condivisione video.
@@ -810,6 +841,7 @@ impl Player {
             recent,
             recent_dirty: false,
             current_replaced: false,
+            position: Duration::ZERO,
             video: None,
             video_config,
         }
@@ -817,11 +849,11 @@ impl Player {
 
     /// Avvia audio (e video, se attivo) di un brano. Non tocca la sorgente
     /// corrente: se fallisce, quella resta com'era.
-    fn spawn_track(&mut self, track: &Track) -> Result<PipeStream> {
-        let stream = spawn_stream(&track.url)?;
+    fn spawn_track(&mut self, track: &Track, at: Duration) -> Result<PipeStream> {
+        let stream = spawn_stream(&track.url, at)?;
         let height = self.video_config.encoder.height;
         if let Some(video) = &mut self.video {
-            video.play(track, height);
+            video.play(track, height, at);
         }
         Ok(stream)
     }
@@ -898,7 +930,7 @@ impl Player {
     /// Fa partire il brano subito, uccidendo la sorgente precedente.
     /// L'annuncio include titolo + copertina inline ([img] = preview, non file).
     fn start_track_now(&mut self, track: Track) -> String {
-        match self.spawn_track(&track) {
+        match self.spawn_track(&track, Duration::ZERO) {
             Ok(stream) => {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
@@ -907,6 +939,7 @@ impl Player {
                 self.current = Some(track);
                 self.current_replaced = false;
                 self.paused = false;
+                self.position = Duration::ZERO;
                 self.eq.reset();
                 msg
             }
@@ -917,7 +950,7 @@ impl Player {
     /// Fa partire il prossimo in coda. Ritorna il messaggio da annunciare (se c'è).
     fn start_next(&mut self) -> Option<String> {
         let next = self.queue.pop_front()?;
-        match self.spawn_track(&next) {
+        match self.spawn_track(&next, Duration::ZERO) {
             Ok(stream) => {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
@@ -926,6 +959,7 @@ impl Player {
                 self.current = Some(next);
                 self.current_replaced = false;
                 self.paused = false;
+                self.position = Duration::ZERO;
                 self.eq.reset();
                 Some(msg)
             }
@@ -936,16 +970,54 @@ impl Player {
     /// Fa ripartire il brano corrente (usato dal loop "one").
     fn restart_current(&mut self) -> Option<String> {
         let cur = self.current.clone()?;
-        match self.spawn_track(&cur) {
+        match self.spawn_track(&cur, Duration::ZERO) {
             Ok(stream) => {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
                 self.paused = false;
+                self.position = Duration::ZERO;
                 self.eq.reset();
                 Some(cur.announce("Ripeto"))
             }
             Err(e) => Some(format!("Replay fallito per {}: {e:#}", cur.display())),
         }
+    }
+
+    /// Sposta la riproduzione del brano corrente a `target`, riavviando la
+    /// pipe (yt-dlp/ffmpeg non sono riposizionabili a caldo). Il video, se
+    /// attivo, riparte dallo stesso punto così resta in sincrono.
+    fn seek_to(&mut self, target: Duration) -> String {
+        if !matches!(self.source, Source::Stream { .. }) {
+            return "Niente da spostare: nessun brano in riproduzione.".to_string();
+        }
+        let Some(track) = self.current.clone() else {
+            return "Niente da spostare: nessun brano in riproduzione.".to_string();
+        };
+        match self.spawn_track(&track, target) {
+            Ok(stream) => {
+                kill_source(&mut self.source);
+                self.source = Source::Stream { stream };
+                self.position = target;
+                self.paused = false;
+                self.eq.reset();
+                format!("{} a {}", track.display(), format_pos(target))
+            }
+            // La sorgente precedente è intatta: `spawn_track` non l'ha toccata.
+            Err(e) => format!("Spostamento fallito: {e:#}"),
+        }
+    }
+
+    /// `!avanti` / `!indietro`: seek relativo alla posizione corrente,
+    /// senza andare sotto zero. Oltre la fine del brano, questo finisce e si
+    /// passa al successivo, come per una riproduzione normale.
+    fn seek_by(&mut self, delta: i64) -> String {
+        if !matches!(self.source, Source::Stream { .. }) {
+            return "Niente da spostare: nessun brano in riproduzione.".to_string();
+        }
+        let now = self.position.as_secs() as i64;
+        let target = Duration::from_secs((now + delta).max(0) as u64);
+        let verb = if delta >= 0 { "Avanti" } else { "Indietro" };
+        format!("{verb} di {}s: {}", delta.abs(), self.seek_to(target))
     }
 
     fn eq_summary(&self) -> String {
@@ -956,9 +1028,35 @@ impl Player {
     }
 }
 
+/// Posizione nel brano come `m:ss` (o `h:mm:ss` oltre l'ora).
+fn format_pos(pos: Duration) -> String {
+    let secs = pos.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Interpreta la posizione di `!seek`: `90`, `1:30` o `1:02:03`.
+fn parse_pos(raw: &str) -> Option<Duration> {
+    let mut secs: u64 = 0;
+    let parts: Vec<&str> = raw.split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    for part in &parts {
+        secs = secs * 60 + part.trim().parse::<u64>().ok()?;
+    }
+    Some(Duration::from_secs(secs))
+}
+
 fn kill_source(source: &mut Source) {
     if let Source::Stream { stream } = source {
-        let _ = stream.ytdlp.start_kill();
+        if let Some(ytdlp) = &mut stream.ytdlp {
+            let _ = ytdlp.start_kill();
+        }
         let _ = stream.ffmpeg.start_kill();
     }
     *source = Source::Idle;
@@ -986,9 +1084,17 @@ fn apply_volume(pcm: &mut [i16], volume: f32) {
 
 /// Avvia `yt-dlp -f bestaudio -o - <url>` pipato in
 /// `ffmpeg -i pipe:0 -f s16le -ar 48000 -ac 1 pipe:1`.
-fn spawn_stream(url: &str) -> Result<PipeStream> {
+///
+/// Con `at` > 0 (seek) si salta il passaggio per la pipe: `yt-dlp -g` dà la
+/// URL diretta del flusso e ffmpeg ci si posiziona sopra con `-ss`, scaricando
+/// via HTTP solo da lì in avanti. La risoluzione avviene dentro la shell
+/// figlia, così il tick audio da 20ms non si blocca ad aspettare yt-dlp.
+fn spawn_stream(url: &str, at: Duration) -> Result<PipeStream> {
     if !is_url(url) {
         anyhow::bail!("URL non valido (deve iniziare con http:// o https://)");
+    }
+    if !at.is_zero() {
+        return spawn_seeked_stream(url, at);
     }
     let mut ytdlp = tokio::process::Command::new("yt-dlp")
         .args([
@@ -1043,11 +1149,48 @@ fn spawn_stream(url: &str) -> Result<PipeStream> {
         .context("ffmpeg: stdout non disponibile")?;
 
     Ok(PipeStream {
-        ytdlp,
+        ytdlp: Some(ytdlp),
         ffmpeg,
         stdout,
         pending: Vec::with_capacity(8192),
     })
+}
+
+/// Audio del brano a partire da `at`, come sopra ma senza yt-dlp nella pipe:
+/// è ffmpeg ad aprire la URL diretta, che (a differenza di uno stdin) può
+/// posizionare con una richiesta HTTP range invece di leggere tutto.
+fn spawn_seeked_stream(url: &str, at: Duration) -> Result<PipeStream> {
+    let script = format!(
+        "exec ffmpeg -hide_banner -loglevel error -ss {ss:.3} \
+         -i \"$(yt-dlp -f bestaudio -g --no-playlist --quiet --no-warnings {url})\" \
+         -f s16le -ar 48000 -ac 1 pipe:1",
+        ss = at.as_secs_f64(),
+        url = shell_quote(url),
+    );
+    let mut ffmpeg = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("sh/ffmpeg non avviabile")?;
+
+    let stdout = ffmpeg.stdout.take().context("ffmpeg: stdout non disponibile")?;
+
+    Ok(PipeStream {
+        ytdlp: None,
+        ffmpeg,
+        stdout,
+        pending: Vec::with_capacity(8192),
+    })
+}
+
+/// Racchiude un argomento per `sh -c`. Le URL arrivano dalla chat: senza
+/// questo, un apice nell'URL farebbe eseguire il resto come comando.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
 /// Risolve un URL in uno o più brani con titolo + copertina.
@@ -1411,10 +1554,13 @@ async fn main() -> Result<()> {
     if player.video_config.bind_addrs.is_empty() {
         player.video_config.bind_addrs = BroadcastConfig::default().bind_addrs;
     }
-    if saved.video {
+    // Video all'avvio: per scelta fissa (--video-auto) o perché era acceso
+    // quando il bot si è fermato l'ultima volta.
+    if args.video_auto || saved.video {
+        let why = if args.video_auto { "automatico (--video-auto)" } else { "ripristinato" };
         match player.enable_video(&mut client) {
-            Ok(_) => info!("Video ripristinato"),
-            Err(e) => warn!("ripristino video fallito: {e:#}"),
+            Ok(_) => info!("Video {why}"),
+            Err(e) => warn!("video all'avvio fallito: {e:#}"),
         }
     }
     let mut playlists = load_playlists(&args.playlists);
@@ -1700,7 +1846,14 @@ async fn main() -> Result<()> {
                         // attesa, poi chiusura se nessuno rimette musica.
                         let since = *video.idle_since.get_or_insert_with(Instant::now);
                         // (Ri)parte anche se l'animazione si è interrotta da sola.
-                        if !video.showing_idle || !video.broadcaster.has_video() || video.broadcaster.video_finished() {
+                        // Se l'animazione non è partita (ffmpeg che rifiuta il
+                        // grafo, per dire) si riprova, ma non a ogni tick da 20ms.
+                        let retry_due = video
+                            .idle_started
+                            .is_none_or(|since| since.elapsed() >= Video::IDLE_RETRY);
+                        if !video.showing_idle
+                            || ((!video.broadcaster.has_video() || video.broadcaster.video_finished()) && retry_due)
+                        {
                             video.show_idle(height, Some(Video::IDLE_TIMEOUT.saturating_sub(since.elapsed())));
                         }
                         if since.elapsed() >= Video::IDLE_TIMEOUT && player.queue.is_empty() {
@@ -1714,6 +1867,7 @@ async fn main() -> Result<()> {
                             video.broadcaster.clear_viewers();
                             video.open = false;
                             video.showing_idle = false;
+                            video.idle_started = None;
                             video.idle_since = None;
                         }
                     }
@@ -1824,6 +1978,9 @@ async fn main() -> Result<()> {
                             // (ffmpeg intanto riempie il buffer, poi si ferma).
                         } else if stream.pending.len() >= PipeStream::FRAME_BYTES {
                             let raw: Vec<u8> = stream.pending.drain(..PipeStream::FRAME_BYTES).collect();
+                            // Un frame emesso = 20ms di brano andati (in pausa
+                            // non si arriva qui, quindi la posizione sta ferma).
+                            player.position += Duration::from_millis(20);
                             let mut pcm = vec![0i16; frame_samples];
                             for (i, s) in pcm.iter_mut().enumerate() {
                                 *s = i16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]);
@@ -1907,6 +2064,15 @@ fn handle_chat(
     let cmd = parts.next().unwrap_or("").to_lowercase();
     let rest: Vec<&str> = parts.collect();
 
+    /// Secondi di salto di `!avanti`/`!indietro`: l'argomento se c'è e ha
+    /// senso, altrimenti il default. `None` = argomento non numerico.
+    fn seek_arg(rest: &[&str], default: i64) -> Option<i64> {
+        match rest.first() {
+            None => Some(default),
+            Some(raw) => raw.trim().parse::<i64>().ok().filter(|s| *s > 0),
+        }
+    }
+
     /// Applica un preset EQ e lo persiste. Ritorna il messaggio di conferma.
     fn apply_eq_preset(player: &mut Player, saved: &mut BotState, state_path: &str, name: &str) -> String {
         match eq_preset_gains(name) {
@@ -1934,7 +2100,7 @@ fn handle_chat(
 
     match cmd.as_str() {
         "help" => Some(
-            "Comandi: !play <url|ricerca|hz> !stop !skip !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !ytplaylist <ricerca> !playlist <nome> !playlists !recent !video [on|off] !join !say !users !channels".to_string(),
+            "Comandi: !play <url|ricerca|hz> !stop !skip !ff [s] !rw [s] !seek <m:ss> !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !ytplaylist <ricerca> !playlist <nome> !playlists !recent !video [on|off] !join !say !users !channels".to_string(),
         ),
         "users" => {
             let mut users = client.users();
@@ -2079,6 +2245,26 @@ fn handle_chat(
                 Some("Skip. Niente altro in coda.".to_string())
             }
         }
+        "ff" | "fw" | "avanti" | "forward" => match seek_arg(&rest, 10) {
+            Some(secs) => Some(player.seek_by(secs)),
+            None => Some("Uso: !ff [secondi] (default 10), es. !ff 30".to_string()),
+        },
+        "rw" | "indietro" | "back" | "rewind" => match seek_arg(&rest, 10) {
+            Some(secs) => Some(player.seek_by(-secs)),
+            None => Some("Uso: !rw [secondi] (default 10), es. !rw 30".to_string()),
+        },
+        "seek" | "vai" => {
+            if rest.is_empty() {
+                return Some(format!(
+                    "Posizione: {} (uso: !seek <m:ss|secondi>)",
+                    format_pos(player.position)
+                ));
+            }
+            match parse_pos(rest[0]) {
+                Some(target) => Some(format!("Vado a {}", player.seek_to(target))),
+                None => Some("Uso: !seek <m:ss|secondi>, es. !seek 1:30".to_string()),
+            }
+        }
         "pause" | "pausa" => {
             if !player.is_busy() {
                 return Some("Niente in riproduzione.".to_string());
@@ -2113,7 +2299,8 @@ fn handle_chat(
         "now" | "nowplaying" | "np" => {
             let state = if player.paused { " (in pausa)" } else { "" };
             let extra = format!(
-                "(vol {:.0}%, loop {}, {})",
+                "(a {}, vol {:.0}%, loop {}, {})",
+                format_pos(player.position),
                 player.volume * 100.0,
                 player.loop_mode.as_str(),
                 player.eq_summary()
@@ -2409,6 +2596,53 @@ mod tests {
                 .unwrap();
             assert!(out.status.success(), "{graph}\n{}", String::from_utf8_lossy(&out.stderr));
         }
+    }
+
+    #[test]
+    fn pos_roundtrip() {
+        assert_eq!(format_pos(Duration::from_secs(0)), "0:00");
+        assert_eq!(format_pos(Duration::from_secs(95)), "1:35");
+        assert_eq!(format_pos(Duration::from_secs(3723)), "1:02:03");
+        assert_eq!(parse_pos("90"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_pos("1:30"), Some(Duration::from_secs(90)));
+        assert_eq!(parse_pos("1:02:03"), Some(Duration::from_secs(3723)));
+        assert_eq!(parse_pos("un minuto"), None);
+        assert_eq!(parse_pos("1:2:3:4"), None);
+    }
+
+    /// Senza seek si resta sulla pipe di yt-dlp; col seek ffmpeg apre la URL
+    /// diretta e `-ss` sta prima di `-i` (input seek, non decodifica inutile).
+    #[test]
+    fn video_command_seeks_on_direct_url() {
+        let plain = ytdlp_video_command("https://esempio/x", 720, Duration::ZERO);
+        assert_eq!(plain.get_program(), "yt-dlp");
+        let seeked = ytdlp_video_command("https://esempio/x", 720, Duration::from_secs(42));
+        assert_eq!(seeked.get_program(), "sh");
+        let line: String = seeked
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(line.contains("-ss 42.000"), "{line}");
+        assert!(line.contains("yt-dlp") && line.contains("-g"), "{line}");
+        assert!(line.find("-ss").unwrap() < line.find("-i ").unwrap(), "{line}");
+    }
+
+    /// Le URL arrivano dalla chat e finiscono in `sh -c`: un apice non deve
+    /// poter chiudere la stringa e far eseguire altro.
+    #[test]
+    fn shell_quote_neutralizes_quotes() {
+        assert_eq!(shell_quote("https://x/y"), "'https://x/y'");
+        // Il controllo vero è che `sh` la tratti come un argomento solo,
+        // stampandola identica e senza eseguire il comando iniettato.
+        let evil = shell_quote("https://x/'; touch /tmp/pwned; echo '");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {evil}"))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "https://x/'; touch /tmp/pwned; echo '");
+        assert!(!std::path::Path::new("/tmp/pwned").exists());
     }
 
     #[test]

@@ -38,6 +38,12 @@ if [ "$BIN" = "music-bot" ]; then
   if [ -n "${TS_VIDEO_HEIGHT:-}" ]; then set -- "$@" --video-height "$TS_VIDEO_HEIGHT"; fi
   if [ -n "${TS_VIDEO_BITRATE:-}" ]; then set -- "$@" --video-bitrate "$TS_VIDEO_BITRATE"; fi
   if [ -n "${TS_VIDEO_BIND:-}" ]; then set -- "$@" --video-bind "$TS_VIDEO_BIND"; fi
+  # TS_VIDEO_AUTO: video acceso all'avvio senza !video on. Spento per default;
+  # "0"/"false"/"no" (e il vuoto) restano spenti, qualsiasi altra cosa accende.
+  case "${TS_VIDEO_AUTO:-}" in
+    ""|0|false|FALSE|no|NO) ;;
+    *) set -- "$@" --video-auto ;;
+  esac
 fi
 
 exec "$@"
