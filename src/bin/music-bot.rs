@@ -15,7 +15,11 @@
 //!   !play <url|ricerca|hz>, !stop, !skip, !queue, !now, !volume <0-200>,
 //!   !pause, !resume, !eq <preset|show|list>, !bass/!mid/!treble <-12..+12>,
 //!   !loop [off|one|all], !lofi, !ytplaylist <ricerca>, !playlist <nome>, !playlists,
-//!   !playlistsave <nome> [url...], !playlistdel <nome>
+//!   !playlistsave <nome> [url...], !playlistdel <nome>, !recent
+//!
+//! Benvenuto: se il bot è da solo nel canale e qualcuno entra, dopo
+//! `--welcome-delay-ms` manda in canale un riepilogo (brano corrente,
+//! playlist salvate, ultimi brani ascoltati).
 
 use std::collections::VecDeque;
 use std::process::Stdio;
@@ -66,6 +70,11 @@ struct Args {
     /// File playlist salvate (nome -> lista URL)
     #[arg(long, default_value = "playlists.json")]
     playlists: String,
+
+    /// Ritardo del messaggio di benvenuto quando qualcuno entra nel canale
+    /// in cui il bot era da solo (ms). 0 = disattivato.
+    #[arg(long, default_value_t = 1500)]
+    welcome_delay_ms: u64,
 }
 
 /// Stato persistente tra riavvii: volume, EQ, loop e ultimo canale joinato.
@@ -92,6 +101,9 @@ struct BotState {
     /// Modalità loop: "off" | "one" | "all".
     #[serde(default = "default_loop_mode")]
     loop_mode: String,
+    /// Ultimi brani riprodotti (più recente per primo), mostrati nel benvenuto e in !recent.
+    #[serde(default)]
+    recent: Vec<Track>,
 }
 
 impl Default for BotState {
@@ -105,6 +117,7 @@ impl Default for BotState {
             eq_treble: 0.0,
             eq_preset: default_eq_preset(),
             loop_mode: default_loop_mode(),
+            recent: Vec::new(),
         }
     }
 }
@@ -162,13 +175,15 @@ impl BotState {
 }
 
 /// Un brano in coda o in riproduzione: URL + titolo + copertina (se risolti via yt-dlp).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Track {
     url: String,
     /// Titolo YouTube (es. "Big Buck Bunny ..."). Se `None`, si mostra l'URL.
+    #[serde(default)]
     title: Option<String>,
     /// URL della copertina (thumbnail YouTube). Se `Some`, viene inviata come
     /// `[img]...[/img]` così il client TeamSpeak mostra la preview inline.
+    #[serde(default)]
     thumbnail: Option<String>,
 }
 
@@ -585,10 +600,17 @@ struct Player {
     eq_preset: String,
     /// Modalità di ripetizione.
     loop_mode: LoopMode,
+    /// Ultimi brani avviati (più recente per primo, max `RECENT_MAX`).
+    recent: Vec<Track>,
+    /// true se `recent` è cambiato e va persistito nel file stato.
+    recent_dirty: bool,
 }
 
 impl Player {
-    fn new(volume: f32, eq: Eq, eq_preset: String, loop_mode: LoopMode) -> Self {
+    /// Quanti brani ricordare nello storico.
+    const RECENT_MAX: usize = 10;
+
+    fn new(volume: f32, eq: Eq, eq_preset: String, loop_mode: LoopMode, recent: Vec<Track>) -> Self {
         Self {
             source: Source::Idle,
             queue: VecDeque::new(),
@@ -598,7 +620,17 @@ impl Player {
             eq,
             eq_preset,
             loop_mode,
+            recent,
+            recent_dirty: false,
         }
+    }
+
+    /// Registra un brano nello storico (in testa, senza duplicati).
+    fn remember(&mut self, track: &Track) {
+        self.recent.retain(|t| t.url != track.url);
+        self.recent.insert(0, track.clone());
+        self.recent.truncate(Self::RECENT_MAX);
+        self.recent_dirty = true;
     }
 
     fn is_busy(&self) -> bool {
@@ -627,6 +659,7 @@ impl Player {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
                 let msg = track.announce("Riproduco");
+                self.remember(&track);
                 self.current = Some(track);
                 self.paused = false;
                 self.eq.reset();
@@ -644,6 +677,7 @@ impl Player {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
                 let msg = next.announce("Prossimo");
+                self.remember(&next);
                 self.current = Some(next);
                 self.paused = false;
                 self.eq.reset();
@@ -944,6 +978,59 @@ async fn find_youtube_playlist(query: &str) -> Option<(String, String)> {
     Some((title.to_string(), link.to_string()))
 }
 
+/// Benvenuto in attesa: chi è entrato e quando mandare il messaggio.
+struct PendingWelcome {
+    user_id: u16,
+    nickname: String,
+    at: tokio::time::Instant,
+}
+
+/// true se `user_id` è appena entrato in `channel_id` e nel canale, a parte
+/// il bot e lui, non c'è nessun altro (client query esclusi).
+fn joined_lonely_bot(client: &Client, user_id: u16, channel_id: u64) -> bool {
+    let Some(me) = client.client_id() else {
+        return false;
+    };
+    if user_id == me || client.channel_id() != Some(channel_id) {
+        return false;
+    }
+    !client.users().iter().any(|u| {
+        u.channel_id == channel_id && u.id != me && u.id != user_id && u.client_type == 0
+    })
+}
+
+/// Messaggio di benvenuto: brano corrente, playlist salvate, ultimi brani.
+fn welcome_message(nickname: &str, player: &Player, playlists: &SavedPlaylists) -> String {
+    let mut out = format!("[b]Ciao {nickname}![/b] Sono il music bot, scrivi !help per i comandi.\n");
+    if let Some(cur) = &player.current {
+        let state = if player.paused { " (in pausa)" } else { "" };
+        out.push_str(&format!("[b]In riproduzione{state}:[/b] {}\n", cur.display()));
+        if !player.queue.is_empty() {
+            out.push_str(&format!("In coda: {} brani (!queue)\n", player.queue.len()));
+        }
+    }
+    if playlists.is_empty() {
+        out.push_str("Nessuna playlist salvata (!playlistsave <nome>).\n");
+    } else {
+        let mut names: Vec<(&String, usize)> =
+            playlists.iter().map(|(n, v)| (n, v.len())).collect();
+        names.sort();
+        let list: Vec<String> = names.iter().map(|(n, c)| format!("{n} ({c})")).collect();
+        out.push_str(&format!(
+            "[b]Playlist salvate:[/b] {} → !playlist <nome>\n",
+            list.join(", ")
+        ));
+    }
+    if !player.recent.is_empty() {
+        out.push_str("[b]Ultimi brani:[/b]\n");
+        for (i, t) in player.recent.iter().take(5).enumerate() {
+            out.push_str(&format!("{}. [url={}]{}[/url]\n", i + 1, t.url, t.display()));
+        }
+    }
+    out.push_str("Per ascoltare: !play <titolo o url>, !lofi, !ytplaylist <ricerca>");
+    out
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder()
@@ -1044,6 +1131,7 @@ async fn main() -> Result<()> {
         Eq::new(saved.eq_bass, saved.eq_mid, saved.eq_treble),
         saved.eq_preset.clone(),
         loop_mode,
+        saved.recent.clone(),
     );
     let mut playlists = load_playlists(&args.playlists);
     if playlists.is_empty() {
@@ -1059,6 +1147,12 @@ async fn main() -> Result<()> {
     let (meta_tx, mut meta_rx) = tokio::sync::mpsc::unbounded_channel::<Resolved>();
 
     let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(20));
+
+    // Benvenuto: ignora gli eventi dei primi secondi (sync iniziale della lista
+    // utenti) così al connect non si salutano tutti quelli già presenti.
+    let welcome_delay = tokio::time::Duration::from_millis(args.welcome_delay_ms);
+    let welcome_armed_at = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let mut pending_welcome: Option<PendingWelcome> = None;
 
     loop {
         tokio::select! {
@@ -1095,7 +1189,20 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
-                                Event::UserJoined { user } => info!("[join] {}", user.nickname),
+                                Event::UserJoined { user } => {
+                                    info!("[join] {}", user.nickname);
+                                    if args.welcome_delay_ms > 0
+                                        && tokio::time::Instant::now() >= welcome_armed_at
+                                        && pending_welcome.is_none()
+                                        && joined_lonely_bot(&client, user.id, user.channel_id)
+                                    {
+                                        pending_welcome = Some(PendingWelcome {
+                                            user_id: user.id,
+                                            nickname: user.nickname.clone(),
+                                            at: tokio::time::Instant::now() + welcome_delay,
+                                        });
+                                    }
+                                }
                                 Event::UserLeft { user, .. } => info!("[leave] {}", user.nickname),
                                 Event::ChannelJoined { channel } => {
                                     // Ci siamo spostati (via !join o trascinati): ricorda il canale.
@@ -1112,6 +1219,16 @@ async fn main() -> Result<()> {
                                             saved.channel_name = Some(n);
                                         }
                                         saved.save(&args.state);
+                                    } else if args.welcome_delay_ms > 0
+                                        && tokio::time::Instant::now() >= welcome_armed_at
+                                        && pending_welcome.is_none()
+                                        && joined_lonely_bot(&client, user.id, to_channel)
+                                    {
+                                        pending_welcome = Some(PendingWelcome {
+                                            user_id: user.id,
+                                            nickname: user.nickname.clone(),
+                                            at: tokio::time::Instant::now() + welcome_delay,
+                                        });
                                     }
                                 }
                                 Event::Disconnected { reason } => {
@@ -1177,6 +1294,28 @@ async fn main() -> Result<()> {
                             let _ = client.send_channel_message(msg);
                         }
                     }
+                }
+
+                // 1c) Benvenuto scaduto: lo mandiamo solo se l'utente è ancora
+                // nel nostro canale (non è uscito/passato oltre nel frattempo).
+                if pending_welcome.as_ref().is_some_and(|w| tokio::time::Instant::now() >= w.at) {
+                    let w = pending_welcome.take().expect("controllato sopra");
+                    let still_here = client
+                        .user(w.user_id)
+                        .is_some_and(|u| Some(u.channel_id) == client.channel_id());
+                    if still_here {
+                        let msg = welcome_message(&w.nickname, &player, &playlists);
+                        if let Err(e) = client.send_channel_message(msg) {
+                            warn!("benvenuto fallito: {e}");
+                        }
+                    }
+                }
+
+                // 1d) Storico brani cambiato: persistilo.
+                if player.recent_dirty {
+                    player.recent_dirty = false;
+                    saved.recent = player.recent.clone();
+                    saved.save(&args.state);
                 }
 
                 // 2) Streaming audio: un frame Opus ogni 20ms
@@ -1306,6 +1445,7 @@ async fn main() -> Result<()> {
     saved.eq_treble = player.eq.treble_db;
     saved.eq_preset = player.eq_preset.clone();
     saved.loop_mode = player.loop_mode.as_str().to_string();
+    saved.recent = player.recent.clone();
     if saved.channel_id != client.channel_id() {
         saved.channel_id = client.channel_id();
         if let Some(id) = saved.channel_id {
@@ -1377,7 +1517,7 @@ fn handle_chat(
 
     match cmd.as_str() {
         "help" => Some(
-            "Comandi: !play <url|ricerca|hz> !stop !skip !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !ytplaylist <ricerca> !playlist <nome> !playlists !join !say !users !channels".to_string(),
+            "Comandi: !play <url|ricerca|hz> !stop !skip !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !ytplaylist <ricerca> !playlist <nome> !playlists !recent !join !say !users !channels".to_string(),
         ),
         "users" => {
             let mut users = client.users();
@@ -1471,6 +1611,16 @@ fn handle_chat(
                 let _ = tx.send(Resolved::plain(tracks));
             });
             Some(loading)
+        }
+        "recent" | "history" | "ultimi" | "storico" => {
+            if player.recent.is_empty() {
+                return Some("Nessun brano ascoltato di recente.".to_string());
+            }
+            let mut out = format!("Ultimi brani ({}):\n", player.recent.len());
+            for (i, t) in player.recent.iter().enumerate() {
+                out.push_str(&format!("{}. [url={}]{}[/url]\n", i + 1, t.url, t.display()));
+            }
+            Some(out)
         }
         "stop" => {
             player.stop_all();
@@ -1861,6 +2011,32 @@ mod tests {
         let plain = Track::new("https://youtu.be/x".to_string(), None, None);
         assert!(!plain.announce("Riproduco").contains("[img]"));
         assert!(plain.display() == "https://youtu.be/x");
+    }
+
+    #[test]
+    fn recent_dedups_and_caps() {
+        let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::Off, Vec::new());
+        for i in 0..15 {
+            p.remember(&Track::new(format!("https://youtu.be/{i}"), None, None));
+        }
+        assert_eq!(p.recent.len(), Player::RECENT_MAX);
+        assert_eq!(p.recent[0].url, "https://youtu.be/14");
+        // Riascoltare un brano lo riporta in testa senza duplicarlo.
+        p.remember(&Track::new("https://youtu.be/10".into(), None, None));
+        assert_eq!(p.recent[0].url, "https://youtu.be/10");
+        assert_eq!(p.recent.iter().filter(|t| t.url == "https://youtu.be/10").count(), 1);
+    }
+
+    #[test]
+    fn welcome_lists_playlists_and_recent() {
+        let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::Off, Vec::new());
+        p.remember(&Track::new("https://youtu.be/x".into(), Some("Brano X".into()), None));
+        let mut pls = SavedPlaylists::new();
+        pls.insert("lofi".into(), vec!["https://a".into(), "https://b".into()]);
+        let msg = welcome_message("Mario", &p, &pls);
+        assert!(msg.contains("Ciao Mario"));
+        assert!(msg.contains("lofi (2)"));
+        assert!(msg.contains("Brano X"));
     }
 
     #[test]
