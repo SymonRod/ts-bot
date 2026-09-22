@@ -604,6 +604,10 @@ struct Player {
     recent: Vec<Track>,
     /// true se `recent` è cambiato e va persistito nel file stato.
     recent_dirty: bool,
+    /// true se la coda è stata sostituita da una nuova playlist mentre questo
+    /// brano suonava: a fine brano non va ripetuto né rimesso in coda dal loop,
+    /// si passa direttamente alla nuova playlist.
+    current_replaced: bool,
 }
 
 impl Player {
@@ -622,6 +626,7 @@ impl Player {
             loop_mode,
             recent,
             recent_dirty: false,
+            current_replaced: false,
         }
     }
 
@@ -642,6 +647,13 @@ impl Player {
         self.queue.clear();
         self.current = None;
         self.paused = false;
+        self.current_replaced = false;
+    }
+
+    /// Sostituisce la coda con una nuova playlist lasciando finire il brano corrente.
+    fn replace_queue(&mut self, tracks: Vec<Track>) {
+        self.queue = tracks.into();
+        self.current_replaced = true;
     }
 
     fn current_display(&self) -> String {
@@ -661,6 +673,7 @@ impl Player {
                 let msg = track.announce("Riproduco");
                 self.remember(&track);
                 self.current = Some(track);
+                self.current_replaced = false;
                 self.paused = false;
                 self.eq.reset();
                 msg
@@ -679,6 +692,7 @@ impl Player {
                 let msg = next.announce("Prossimo");
                 self.remember(&next);
                 self.current = Some(next);
+                self.current_replaced = false;
                 self.paused = false;
                 self.eq.reset();
                 Some(msg)
@@ -903,14 +917,21 @@ async fn resolve_url_list(urls: Vec<String>) -> Vec<Track> {
 
 /// Brani risolti in background e inviati al main loop. `label` (es. il titolo
 /// della playlist YouTube trovata) viene mostrato nell'annuncio in canale.
+/// `replace_queue`: è una playlist caricata esplicitamente (!playlist,
+/// !ytplaylist) e deve sostituire la coda invece di accodarsi.
 struct Resolved {
     tracks: Vec<Track>,
     label: Option<String>,
+    replace_queue: bool,
 }
 
 impl Resolved {
     fn plain(tracks: Vec<Track>) -> Self {
-        Self { tracks, label: None }
+        Self { tracks, label: None, replace_queue: false }
+    }
+
+    fn playlist(tracks: Vec<Track>, label: Option<String>) -> Self {
+        Self { tracks, label, replace_queue: true }
     }
 }
 
@@ -1256,7 +1277,7 @@ async fn main() -> Result<()> {
                 }
 
                 // 1b) Brani risolti in background (titoli/playlist via yt-dlp)
-                while let Ok(Resolved { tracks, label }) = meta_rx.try_recv() {
+                while let Ok(Resolved { tracks, label, replace_queue }) = meta_rx.try_recv() {
                     if tracks.is_empty() {
                         let _ = client.send_channel_message(
                             "Nessun risultato trovato.".to_string(),
@@ -1268,8 +1289,19 @@ async fn main() -> Result<()> {
                     let pl_name = label
                         .map(|l| format!("Playlist '{l}'"))
                         .unwrap_or_else(|| "Playlist".to_string());
-                    if player.is_busy() {
-                        // C'è già qualcosa in riproduzione: accoda tutto.
+                    // Una playlist (esplicita o URL con più brani) sostituisce la coda:
+                    // il brano corrente finisce, poi parte la nuova playlist.
+                    // Un brano singolo invece si accoda.
+                    let replace = replace_queue || n > 1;
+                    if player.is_busy() && replace {
+                        let first = tracks[0].display().to_string();
+                        player.replace_queue(tracks);
+                        let _ = client.send_channel_message(format!(
+                            "{pl_name}: coda sostituita con {n} brani, parte dopo il brano corrente ({}). Primo: {first} (!skip per passare subito)",
+                            player.current_display()
+                        ));
+                    } else if player.is_busy() {
+                        // C'è già qualcosa in riproduzione: accoda.
                         let first = tracks[0].display().to_string();
                         for t in tracks {
                             player.queue.push_back(t);
@@ -1287,7 +1319,11 @@ async fn main() -> Result<()> {
                             ));
                         }
                     } else {
-                        // Libero: parte subito il primo, il resto in coda.
+                        // Libero: parte subito il primo, il resto in coda
+                        // (una playlist rimpiazza gli eventuali avanzi in coda).
+                        if replace {
+                            player.queue.clear();
+                        }
                         let mut it = tracks.into_iter();
                         let first = it.next().expect("non vuoto");
                         let rest: Vec<Track> = it.collect();
@@ -1393,7 +1429,14 @@ async fn main() -> Result<()> {
                             player.current = None;
                             // Loop "one": riparte lo stesso brano.
                             // Loop "all": il brano finito torna in fondo alla coda.
-                            match player.loop_mode {
+                            // Se nel frattempo la coda è stata sostituita da una nuova
+                            // playlist, il brano vecchio non si ripete: si avanza e basta.
+                            let loop_mode = if std::mem::take(&mut player.current_replaced) {
+                                LoopMode::Off
+                            } else {
+                                player.loop_mode
+                            };
+                            match loop_mode {
                                 LoopMode::One => {
                                     if let Some(cur) = finished_track {
                                         player.current = Some(cur);
@@ -1850,10 +1893,9 @@ fn handle_chat(
             let q = query.clone();
             tokio::spawn(async move {
                 let resolved = match find_youtube_playlist(&q).await {
-                    Some((title, url)) => Resolved {
-                        tracks: resolve_tracks(url).await,
-                        label: Some(title),
-                    },
+                    Some((title, url)) => {
+                        Resolved::playlist(resolve_tracks(url).await, Some(title))
+                    }
                     None => Resolved::plain(Vec::new()),
                 };
                 let _ = tx.send(resolved);
@@ -1888,11 +1930,12 @@ fn handle_chat(
                 _ => return Some(format!("Playlist '{name}' non trovata o vuota. Vedi !playlists.")),
             };
             let n = urls.len();
+            let pl_label = name.clone();
             let _ = client.set_input_muted(false);
             let tx = meta_tx.clone();
             tokio::spawn(async move {
                 let tracks = resolve_url_list(urls).await;
-                let _ = tx.send(Resolved::plain(tracks));
+                let _ = tx.send(Resolved::playlist(tracks, Some(pl_label)));
             });
             Some(format!("Caricamento playlist '{name}' ({n} voci)..."))
         }
@@ -2042,6 +2085,24 @@ mod tests {
         p.remember(&Track::new("https://youtu.be/10".into(), None, None));
         assert_eq!(p.recent[0].url, "https://youtu.be/10");
         assert_eq!(p.recent.iter().filter(|t| t.url == "https://youtu.be/10").count(), 1);
+    }
+
+    #[test]
+    fn replace_queue_drops_old_tracks_and_skips_loop() {
+        let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::All, Vec::new());
+        p.current = Some(Track::new("https://youtu.be/skillet0".into(), None, None));
+        p.queue.push_back(Track::new("https://youtu.be/skillet1".into(), None, None));
+        p.queue.push_back(Track::new("https://youtu.be/skillet2".into(), None, None));
+        p.replace_queue(vec![
+            Track::new("https://youtu.be/lp1".into(), None, None),
+            Track::new("https://youtu.be/lp2".into(), None, None),
+        ]);
+        let urls: Vec<&str> = p.queue.iter().map(|t| t.url.as_str()).collect();
+        assert_eq!(urls, ["https://youtu.be/lp1", "https://youtu.be/lp2"]);
+        // A fine brano il loop non deve rimettere in coda il brano vecchio.
+        assert!(p.current_replaced);
+        p.stop_all();
+        assert!(!p.current_replaced);
     }
 
     #[test]
