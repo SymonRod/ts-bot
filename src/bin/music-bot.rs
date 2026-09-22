@@ -1086,6 +1086,12 @@ async fn main() -> Result<()> {
     }
     let config = cfg.build()?;
 
+    // SIGTERM (docker stop / compose down): nel container siamo PID 1 e senza
+    // handler il segnale viene ignorato, Docker aspetta 10s e fa SIGKILL, e il
+    // server vede "Timed Out". Lo gestiamo come Ctrl+C: disconnessione pulita.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("registrazione handler SIGTERM fallita")?;
+
     // Retry con backoff esponenziale: un exit immediato + restart di Docker
     // martella il server e fa scattare il ban anti-flood (ConnectFailedBanned).
     let mut client = {
@@ -1103,7 +1109,14 @@ async fn main() -> Result<()> {
                 Ok(c) => break c,
                 Err(e) => {
                     warn!("Connessione fallita: {e:#}. Riprovo tra {}s", delay.as_secs());
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = sigterm.recv() => {
+                            info!("SIGTERM durante la connessione, esco");
+                            return Ok(());
+                        }
+                        _ = tokio::signal::ctrl_c() => return Ok(()),
+                    }
                     delay = (delay * 2).min(max_delay);
                 }
             }
@@ -1432,6 +1445,10 @@ async fn main() -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Chiusura...");
+                break;
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM ricevuto, chiusura...");
                 break;
             }
         }
