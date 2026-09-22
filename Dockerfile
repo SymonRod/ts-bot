@@ -32,7 +32,7 @@ RUN cargo build --release --bin chat-bot --bin music-bot \
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates ffmpeg python3 python3-pip \
+    ca-certificates ffmpeg python3 python3-pip fonts-dejavu-core \
     libasound2 libssl3 \
     && pip install --no-cache-dir --break-system-packages yt-dlp \
     && rm -rf /var/lib/apt/lists/* \
@@ -42,6 +42,7 @@ COPY --from=builder /usr/local/bin/chat-bot /usr/local/bin/music-bot /usr/local/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+# fonts-dejavu-core: font per le scritte dell'animazione di attesa di !video.
 # Identità TS e stato persistente (monta un volume qui).
 RUN mkdir -p /data && chown bot:bot /data
 VOLUME /data

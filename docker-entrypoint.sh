@@ -34,5 +34,10 @@ fi
 if [ -n "${TS_CHANNEL:-}" ]; then
   set -- "$@" --channel "$TS_CHANNEL"
 fi
+if [ "$BIN" = "music-bot" ]; then
+  if [ -n "${TS_VIDEO_HEIGHT:-}" ]; then set -- "$@" --video-height "$TS_VIDEO_HEIGHT"; fi
+  if [ -n "${TS_VIDEO_BITRATE:-}" ]; then set -- "$@" --video-bitrate "$TS_VIDEO_BITRATE"; fi
+  if [ -n "${TS_VIDEO_BIND:-}" ]; then set -- "$@" --video-bind "$TS_VIDEO_BIND"; fi
+fi
 
 exec "$@"

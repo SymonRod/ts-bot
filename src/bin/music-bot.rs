@@ -15,7 +15,12 @@
 //!   !play <url|ricerca|hz>, !stop, !skip, !queue, !now, !volume <0-200>,
 //!   !pause, !resume, !eq <preset|show|list>, !bass/!mid/!treble <-12..+12>,
 //!   !loop [off|one|all], !lofi, !ytplaylist <ricerca>, !playlist <nome>, !playlists,
-//!   !playlistsave <nome> [url...], !playlistdel <nome>, !recent
+//!   !playlistsave <nome> [url...], !playlistdel <nome>, !recent, !video [on|off]
+//!
+//! Video (TeamSpeak 6): con `!video on` il bot condivide il video del brano
+//! come screen share P2P, mentre l'audio resta sul canale vocale. Ogni viewer
+//! riceve una copia del video direttamente dal bot, quindi serve banda in
+//! upload e il bot deve essere raggiungibile via UDP (in Docker: rete host).
 //!
 //! Benvenuto: se il bot è da solo nel canale e qualcuno entra, dopo
 //! `--welcome-delay-ms` manda in canale un riepilogo (brano corrente,
@@ -23,6 +28,7 @@
 
 use std::collections::VecDeque;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -34,7 +40,8 @@ use tracing_subscriber::FmtSubscriber;
 use tslib_audio::codec::{Encoder, OpusEncoder};
 use tslib_audio::config::{AudioConfig, OpusApplication};
 use tslib_core::events::{AudioCodec, Event, MessageTarget};
-use tslib_core::{Client, ClientConfig, Identity};
+use tslib_core::{Client, ClientConfig, Identity, StreamSetup};
+use tslib_stream::{BroadcastConfig, BroadcastEvent, Broadcaster, EncoderConfig, VideoInput};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Music bot TeamSpeak con tslib")]
@@ -75,6 +82,19 @@ struct Args {
     /// in cui il bot era da solo (ms). 0 = disattivato.
     #[arg(long, default_value_t = 1500)]
     welcome_delay_ms: u64,
+
+    /// Altezza del video condiviso con !video (la larghezza segue il formato)
+    #[arg(long, default_value_t = 480)]
+    video_height: u32,
+
+    /// Bitrate del video in kbit/s, per ogni viewer (in P2P ognuno ne riceve una copia)
+    #[arg(long, default_value_t = 800)]
+    video_bitrate: u32,
+
+    /// Indirizzo locale per WebRTC (es. 192.168.1.10:0). Default: tutte le
+    /// interfacce, bridge Docker compresi.
+    #[arg(long)]
+    video_bind: Option<String>,
 }
 
 /// Stato persistente tra riavvii: volume, EQ, loop e ultimo canale joinato.
@@ -104,6 +124,9 @@ struct BotState {
     /// Ultimi brani riprodotti (più recente per primo), mostrati nel benvenuto e in !recent.
     #[serde(default)]
     recent: Vec<Track>,
+    /// Condivisione video attiva (!video on).
+    #[serde(default)]
+    video: bool,
 }
 
 impl Default for BotState {
@@ -118,6 +141,7 @@ impl Default for BotState {
             eq_preset: default_eq_preset(),
             loop_mode: default_loop_mode(),
             recent: Vec::new(),
+            video: false,
         }
     }
 }
@@ -583,6 +607,154 @@ impl PipeStream {
     const MAX_PENDING: usize = Self::FRAME_BYTES * 100;
 }
 
+/// Condivisione video (screen share TeamSpeak 6) del brano in riproduzione.
+/// L'audio resta sul canale vocale; qui c'è solo l'immagine.
+struct Video {
+    broadcaster: Broadcaster,
+    /// Stream aperto sul server (`setupstream` inviato). Si chiude da solo
+    /// dopo `IDLE_TIMEOUT` senza brani e si riapre col brano successivo.
+    open: bool,
+    /// Da quando non c'è nessun brano in riproduzione.
+    idle_since: Option<Instant>,
+    /// In onda c'è l'animazione di attesa, non un video.
+    showing_idle: bool,
+    /// Assegnato dal server dopo `setupstream`: finché è `None` le richieste
+    /// dei viewer non si possono accettare.
+    stream_id: Option<String>,
+    /// L'audio del brano aspetta il primo frame video fino a quest'istante,
+    /// così partono insieme. Poi parte comunque.
+    hold_audio_until: Option<Instant>,
+    /// Nome da dare allo stream (titolo del brano) appena possibile.
+    pending_name: Option<String>,
+}
+
+impl Video {
+    /// Quanto al massimo l'audio aspetta il video.
+    const MAX_AUDIO_HOLD: Duration = Duration::from_secs(10);
+    /// Nomi lunghi potrebbero essere rifiutati dal server: meglio accorciare.
+    const MAX_NAME_CHARS: usize = 40;
+    /// Quanto resta aperta la live senza brani prima di chiudersi.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+    fn new(config: &BroadcastConfig) -> Self {
+        Self {
+            broadcaster: Broadcaster::new(config.clone()),
+            open: false,
+            idle_since: None,
+            showing_idle: false,
+            stream_id: None,
+            hold_audio_until: None,
+            pending_name: None,
+        }
+    }
+
+    /// Manda in onda l'animazione di attesa. Con `countdown` mostra anche
+    /// quanto manca alla chiusura della live.
+    fn show_idle(&mut self, height: u32, countdown: Option<Duration>) {
+        if let Err(e) = self.broadcaster.play(VideoInput::Lavfi(idle_animation(height, countdown))) {
+            warn!("animazione di attesa non avviata: {e}");
+        }
+        self.showing_idle = true;
+    }
+
+    fn play(&mut self, track: &Track, height: u32) {
+        self.showing_idle = false;
+        match self.broadcaster.play(VideoInput::Command(ytdlp_video_command(&track.url, height))) {
+            Ok(()) => self.hold_audio_until = Some(Instant::now() + Self::MAX_AUDIO_HOLD),
+            Err(e) => {
+                warn!("video non avviato: {e}");
+                self.hold_audio_until = None;
+            }
+        }
+        self.pending_name = Some(track.display().chars().take(Self::MAX_NAME_CHARS).collect());
+    }
+
+    /// true finché l'audio deve aspettare il primo frame video.
+    fn holds_audio(&mut self) -> bool {
+        let waiting = self
+            .hold_audio_until
+            .is_some_and(|until| Instant::now() < until && !self.broadcaster.video_started());
+        if !waiting {
+            self.hold_audio_until = None;
+        }
+        waiting
+    }
+}
+
+/// Schermata di attesa generata da ffmpeg, stile vecchio salvaschermo DVD:
+/// il logo "MusicBot" rimbalza sui bordi e cambia colore a ogni urto, sopra
+/// un gradiente che oscilla lentamente di tinta (periodico: niente derive nel
+/// tempo). In basso il suggerimento e, con `countdown`, quanto manca alla
+/// chiusura della live. Costa meno di mezzo core.
+fn idle_animation(height: u32, countdown: Option<Duration>) -> String {
+    let (w, h) = ((height * 16 / 9) & !1, height & !1);
+    let px = |size: u32| (size * h / 480).max(1);
+    // Il logo è un livello trasparente di dimensione fissa: così sappiamo in
+    // anticipo dove rimbalza, e quanti rimbalzi ha fatto al tempo t.
+    let (lw, lh) = (px(240), px(100));
+    let (vx, vy) = (px(90), px(70));
+    let bounces = format!("floor(t*{vx}/{})+floor(t*{vy}/{})", w - lw, h - lh);
+
+    let mut graph = format!(
+        "gradients=s={w}x{h}:r=30:c0=0x0f0c29:c1=0x302b63:c2=0x24243e:c3=0x6a3093:nb_colors=4:speed=0:type=radial:x0={cx}:y0={cy}:x1=0:y1=0,\
+         hue=h='40*sin(2*PI*t/20)'",
+        cx = w / 2,
+        cy = h / 2,
+    );
+    let hint = match countdown {
+        Some(_) => "In attesa del prossimo brano  ·  !play <url o titolo>",
+        None => "Solo audio  ·  il video di questo brano è finito",
+    };
+    graph.push_str(&format!(
+        ",drawtext=font=Sans:text='{hint}':fontcolor=white@0.7:fontsize={}:x=(w-tw)/2:y=h-{}",
+        px(18),
+        px(60),
+    ));
+    if let Some(left) = countdown {
+        // Minuti:secondi calcolati da ffmpeg sul tempo dell'animazione, che
+        // parte insieme al conto alla rovescia.
+        let secs = left.as_secs();
+        graph.push_str(&format!(
+            r",drawtext=font=Sans:text='La live si chiude tra %{{eif\:max(0\,{secs}-t)/60\:d}}\:%{{eif\:mod(max(0\,{secs}-t)\,60)\:d\:2}}':fontcolor=white@0.45:fontsize={}:x=(w-tw)/2:y=h-{}",
+            px(15),
+            px(32),
+        ));
+    }
+    graph.push_str(&format!("[bg];color=c=black@0:s={lw}x{lh}:r=30,format=rgba"));
+    graph.push_str(&format!(
+        r",drawtext=font='Sans\:bold':text='MusicBot':fontcolor=0xff4d6d:borderw=2:bordercolor=black@0.35:fontsize={}:x=(w-tw)/2:y=(h-th)/2-{}",
+        px(46),
+        px(10),
+    ));
+    graph.push_str(&format!(
+        r",drawtext=font='Sans\:bold':text='VIDEO':fontcolor=0xff4d6d:fontsize={}:x=(w-tw)/2:y=h-{}",
+        px(18),
+        px(26),
+    ));
+    graph.push_str(&format!(",hue=h='72*({bounces})'[logo]"));
+    graph.push_str(&format!(
+        r";[bg][logo]overlay=x='abs(mod(t*{vx}\,2*(W-w))-(W-w))':y='abs(mod(t*{vy}\,2*(H-h))-(H-h))'"
+    ));
+    graph
+}
+
+/// `yt-dlp` con lo stream solo-video, su stdout. Preferisce H.264 (decodifica
+/// leggera) entro l'altezza richiesta; il ricodificare in VP8 lo fa tslib-stream.
+fn ytdlp_video_command(url: &str, height: u32) -> std::process::Command {
+    let mut cmd = std::process::Command::new("yt-dlp");
+    cmd.args([
+        "-f",
+        &format!("bv*[height<={height}][vcodec^=avc1]/bv*[height<={height}]/b[height<={height}]/b"),
+        "-o",
+        "-",
+        "--no-playlist",
+        "--quiet",
+        "--no-warnings",
+        url,
+    ]);
+    cmd
+}
+
 /// Stato di riproduzione + coda.
 struct Player {
     source: Source,
@@ -608,13 +780,24 @@ struct Player {
     /// brano suonava: a fine brano non va ripetuto né rimesso in coda dal loop,
     /// si passa direttamente alla nuova playlist.
     current_replaced: bool,
+    /// Condivisione video, se attiva (!video on).
+    video: Option<Video>,
+    /// Configurazione con cui aprire la condivisione video.
+    video_config: BroadcastConfig,
 }
 
 impl Player {
     /// Quanti brani ricordare nello storico.
     const RECENT_MAX: usize = 10;
 
-    fn new(volume: f32, eq: Eq, eq_preset: String, loop_mode: LoopMode, recent: Vec<Track>) -> Self {
+    fn new(
+        volume: f32,
+        eq: Eq,
+        eq_preset: String,
+        loop_mode: LoopMode,
+        recent: Vec<Track>,
+        video_config: BroadcastConfig,
+    ) -> Self {
         Self {
             source: Source::Idle,
             queue: VecDeque::new(),
@@ -627,7 +810,56 @@ impl Player {
             recent,
             recent_dirty: false,
             current_replaced: false,
+            video: None,
+            video_config,
         }
+    }
+
+    /// Avvia audio (e video, se attivo) di un brano. Non tocca la sorgente
+    /// corrente: se fallisce, quella resta com'era.
+    fn spawn_track(&mut self, track: &Track) -> Result<PipeStream> {
+        let stream = spawn_stream(&track.url)?;
+        let height = self.video_config.encoder.height;
+        if let Some(video) = &mut self.video {
+            video.play(track, height);
+        }
+        Ok(stream)
+    }
+
+    /// Apre la condivisione video. Il brano in corso riparte da capo, così
+    /// audio e video partono allineati.
+    fn enable_video(&mut self, client: &mut Client) -> Result<String> {
+        if self.video.is_some() {
+            return Ok("Video già attivo.".to_string());
+        }
+        let name = self
+            .current
+            .as_ref()
+            .map(|t| t.display().chars().take(Video::MAX_NAME_CHARS).collect())
+            .unwrap_or_else(|| "MusicBot".to_string());
+        client.setup_stream(&StreamSetup::new(name, self.video_config.encoder.bitrate_kbps * 1000))?;
+        let mut video = Video::new(&self.video_config);
+        video.open = true;
+        self.video = Some(video);
+        let restarted = matches!(self.source, Source::Stream { .. }) && self.restart_current().is_some();
+        Ok(if restarted {
+            "Video attivo: apri lo stream del bot nel client TeamSpeak 6. Riparto il brano da capo per sincronizzare audio e video.".to_string()
+        } else {
+            "Video attivo: apri lo stream del bot nel client TeamSpeak 6. Il video parte col prossimo brano.".to_string()
+        })
+    }
+
+    /// Chiude la condivisione video (i viewer vengono scollegati).
+    fn disable_video(&mut self, client: &mut Client) -> String {
+        let Some(video) = self.video.take() else {
+            return "Video già spento.".to_string();
+        };
+        if let (true, Some(id)) = (video.open, &video.stream_id) {
+            if let Err(e) = client.stop_stream(id) {
+                warn!("stopstream: {e}");
+            }
+        }
+        "Video spento.".to_string()
     }
 
     /// Registra un brano nello storico (in testa, senza duplicati).
@@ -666,7 +898,7 @@ impl Player {
     /// Fa partire il brano subito, uccidendo la sorgente precedente.
     /// L'annuncio include titolo + copertina inline ([img] = preview, non file).
     fn start_track_now(&mut self, track: Track) -> String {
-        match spawn_stream(&track.url) {
+        match self.spawn_track(&track) {
             Ok(stream) => {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
@@ -685,7 +917,7 @@ impl Player {
     /// Fa partire il prossimo in coda. Ritorna il messaggio da annunciare (se c'è).
     fn start_next(&mut self) -> Option<String> {
         let next = self.queue.pop_front()?;
-        match spawn_stream(&next.url) {
+        match self.spawn_track(&next) {
             Ok(stream) => {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
@@ -704,7 +936,7 @@ impl Player {
     /// Fa ripartire il brano corrente (usato dal loop "one").
     fn restart_current(&mut self) -> Option<String> {
         let cur = self.current.clone()?;
-        match spawn_stream(&cur.url) {
+        match self.spawn_track(&cur) {
             Ok(stream) => {
                 kill_source(&mut self.source);
                 self.source = Source::Stream { stream };
@@ -1166,7 +1398,25 @@ async fn main() -> Result<()> {
         saved.eq_preset.clone(),
         loop_mode,
         saved.recent.clone(),
+        BroadcastConfig {
+            encoder: EncoderConfig {
+                height: args.video_height,
+                bitrate_kbps: args.video_bitrate,
+                ..Default::default()
+            },
+            bind_addrs: args.video_bind.clone().into_iter().collect::<Vec<_>>(),
+            ..Default::default()
+        },
     );
+    if player.video_config.bind_addrs.is_empty() {
+        player.video_config.bind_addrs = BroadcastConfig::default().bind_addrs;
+    }
+    if saved.video {
+        match player.enable_video(&mut client) {
+            Ok(_) => info!("Video ripristinato"),
+            Err(e) => warn!("ripristino video fallito: {e:#}"),
+        }
+    }
     let mut playlists = load_playlists(&args.playlists);
     if playlists.is_empty() {
         info!("Nessuna playlist salvata in {}", args.playlists);
@@ -1237,7 +1487,42 @@ async fn main() -> Result<()> {
                                         });
                                     }
                                 }
-                                Event::UserLeft { user, .. } => info!("[leave] {}", user.nickname),
+                                Event::UserLeft { user, .. } => {
+                                    info!("[leave] {}", user.nickname);
+                                    // Chi esce dal server non manda notifystreamclientleft.
+                                    if let Some(video) = &mut player.video {
+                                        video.broadcaster.remove_viewer(user.id);
+                                    }
+                                }
+                                Event::StreamsChanged { .. } => {
+                                    if let Some(video) = &mut player.video {
+                                        let own = client.own_streams().into_iter().next().map(|s| s.id);
+                                        if own != video.stream_id {
+                                            info!("Stream video: {own:?}");
+                                            video.stream_id = own;
+                                        }
+                                    }
+                                }
+                                Event::StreamJoinRequest { viewer_id, stream_id, is_remove } => {
+                                    if let Some(video) = &mut player.video {
+                                        if video.stream_id.as_deref() == Some(stream_id.as_str()) {
+                                            if is_remove {
+                                                info!("[video] {viewer_id} ha chiuso lo stream");
+                                                video.broadcaster.remove_viewer(viewer_id);
+                                            } else {
+                                                info!("[video] {viewer_id} apre lo stream");
+                                                video.broadcaster.add_viewer(viewer_id);
+                                            }
+                                        }
+                                    }
+                                }
+                                Event::StreamSignaling { owner_id: viewer_id, stream_id, json } => {
+                                    if let Some(video) = &mut player.video {
+                                        if video.stream_id.as_deref() == Some(stream_id.as_str()) {
+                                            video.broadcaster.handle_signaling(viewer_id, &json);
+                                        }
+                                    }
+                                }
                                 Event::ChannelJoined { channel } => {
                                     // Ci siamo spostati (via !join o trascinati): ricorda il canale.
                                     saved.channel_id = Some(channel.id);
@@ -1367,6 +1652,74 @@ async fn main() -> Result<()> {
                     saved.save(&args.state);
                 }
 
+                // 1e) Video: offerte ai viewer, nome dello stream, pausa e fine brano.
+                if let Some(video) = &mut player.video {
+                    while let Some(ev) = video.broadcaster.poll_event() {
+                        match ev {
+                            BroadcastEvent::Offer { viewer_id, sdp } => {
+                                if let Some(id) = &video.stream_id {
+                                    if let Err(e) = client.accept_stream_viewer(viewer_id, id, &sdp) {
+                                        warn!("accept_stream_viewer: {e}");
+                                    }
+                                }
+                            }
+                            BroadcastEvent::Connected { viewer_id } => info!("[video] in onda per {viewer_id}"),
+                            BroadcastEvent::Gone { viewer_id, reason } => {
+                                info!("[video] {viewer_id} scollegato: {reason}");
+                            }
+                        }
+                    }
+                    if let Some(id) = video.stream_id.clone() {
+                        if let Some(name) = video.pending_name.take() {
+                            if let Err(e) = client.rename_stream(&id, &name) {
+                                warn!("rename_stream: {e}");
+                            }
+                        }
+                    }
+                    let height = player.video_config.encoder.height;
+                    if matches!(player.source, Source::Stream { .. }) {
+                        video.idle_since = None;
+                        if !video.open {
+                            // La live si era chiusa per inattività: riapriamola.
+                            let name = video.pending_name.take().unwrap_or_else(|| "MusicBot".to_string());
+                            let bitrate = player.video_config.encoder.bitrate_kbps * 1000;
+                            match client.setup_stream(&StreamSetup::new(name, bitrate)) {
+                                Ok(()) => {
+                                    video.open = true;
+                                    info!("Live video riaperta");
+                                }
+                                Err(e) => warn!("setup_stream: {e}"),
+                            }
+                        }
+                        // Il video è finito prima dell'audio (o non è partito).
+                        if video.broadcaster.video_finished() && !video.showing_idle {
+                            video.show_idle(height, None);
+                        }
+                    } else if video.open {
+                        // Niente brano (fermo, finito o sinusoide): animazione di
+                        // attesa, poi chiusura se nessuno rimette musica.
+                        let since = *video.idle_since.get_or_insert_with(Instant::now);
+                        // (Ri)parte anche se l'animazione si è interrotta da sola.
+                        if !video.showing_idle || !video.broadcaster.has_video() || video.broadcaster.video_finished() {
+                            video.show_idle(height, Some(Video::IDLE_TIMEOUT.saturating_sub(since.elapsed())));
+                        }
+                        if since.elapsed() >= Video::IDLE_TIMEOUT && player.queue.is_empty() {
+                            info!("Nessun brano da {} minuti: chiudo la live video", Video::IDLE_TIMEOUT.as_secs() / 60);
+                            if let Some(id) = video.stream_id.take() {
+                                if let Err(e) = client.stop_stream(&id) {
+                                    warn!("stop_stream: {e}");
+                                }
+                            }
+                            video.broadcaster.stop_video();
+                            video.broadcaster.clear_viewers();
+                            video.open = false;
+                            video.showing_idle = false;
+                            video.idle_since = None;
+                        }
+                    }
+                    video.broadcaster.set_paused(player.paused);
+                }
+
                 // 2) Streaming audio: un frame Opus ogni 20ms
                 // Se in pausa: non leggiamo da ffmpeg (backpressure = freeze)
                 // e non inviamo audio.
@@ -1466,6 +1819,9 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
+                        } else if player.video.as_mut().is_some_and(Video::holds_audio) {
+                            // Il video non è ancora partito: l'audio aspetta
+                            // (ffmpeg intanto riempie il buffer, poi si ferma).
                         } else if stream.pending.len() >= PipeStream::FRAME_BYTES {
                             let raw: Vec<u8> = stream.pending.drain(..PipeStream::FRAME_BYTES).collect();
                             let mut pcm = vec![0i16; frame_samples];
@@ -1498,6 +1854,7 @@ async fn main() -> Result<()> {
     }
 
     kill_source(&mut player.source);
+    player.disable_video(&mut client);
     // Ricorda volume + EQ + loop + canale corrente prima di uscire.
     saved.volume = player.volume;
     saved.eq_bass = player.eq.bass_db;
@@ -1577,7 +1934,7 @@ fn handle_chat(
 
     match cmd.as_str() {
         "help" => Some(
-            "Comandi: !play <url|ricerca|hz> !stop !skip !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !ytplaylist <ricerca> !playlist <nome> !playlists !recent !join !say !users !channels".to_string(),
+            "Comandi: !play <url|ricerca|hz> !stop !skip !queue !now !volume !pause !resume !eq <preset> !bass/!mid/!treble !loop !lofi !ytplaylist <ricerca> !playlist <nome> !playlists !recent !video [on|off] !join !say !users !channels".to_string(),
         ),
         "users" => {
             let mut users = client.users();
@@ -1681,6 +2038,32 @@ fn handle_chat(
                 out.push_str(&format!("{}. [url={}]{}[/url]\n", i + 1, t.url, t.display()));
             }
             Some(out)
+        }
+        "video" => {
+            let reply = match rest.first().map(|a| a.to_lowercase()).as_deref() {
+                Some("on" | "si" | "sì") => match player.enable_video(client) {
+                    Ok(msg) => {
+                        saved.video = true;
+                        saved.save(state_path);
+                        msg
+                    }
+                    Err(e) => format!("Video non attivato: {e:#}"),
+                },
+                Some("off" | "no") => {
+                    saved.video = false;
+                    saved.save(state_path);
+                    player.disable_video(client)
+                }
+                Some(_) => "Uso: !video [on|off]".to_string(),
+                None => match &player.video {
+                    Some(video) => format!(
+                        "Video attivo, {} viewer. !video off per spegnerlo.",
+                        video.broadcaster.viewer_count()
+                    ),
+                    None => "Video spento. !video on per condividere il video dei brani (client TeamSpeak 6).".to_string(),
+                },
+            };
+            Some(reply)
         }
         "stop" => {
             player.stop_all();
@@ -2009,6 +2392,25 @@ fn handle_chat(
 mod tests {
     use super::*;
 
+    /// Il grafo dell'animazione passa per tre livelli di escaping (grafo,
+    /// opzioni, espansione del testo): l'unica verifica affidabile è farlo
+    /// renderizzare a ffmpeg. Saltato se ffmpeg non c'è.
+    #[test]
+    fn idle_animation_renders() {
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        for (height, countdown) in [(480, Some(Duration::from_secs(300))), (720, None)] {
+            let graph = idle_animation(height, countdown);
+            let out = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", &graph])
+                .args(["-frames:v", "3", "-f", "null", "-"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{graph}\n{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
     #[test]
     fn eq_presets_all_known() {
         for name in [
@@ -2075,7 +2477,7 @@ mod tests {
 
     #[test]
     fn recent_dedups_and_caps() {
-        let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::Off, Vec::new());
+        let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::Off, Vec::new(), BroadcastConfig::default());
         for i in 0..15 {
             p.remember(&Track::new(format!("https://youtu.be/{i}"), None, None));
         }
@@ -2089,7 +2491,7 @@ mod tests {
 
     #[test]
     fn replace_queue_drops_old_tracks_and_skips_loop() {
-        let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::All, Vec::new());
+        let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::All, Vec::new(), BroadcastConfig::default());
         p.current = Some(Track::new("https://youtu.be/skillet0".into(), None, None));
         p.queue.push_back(Track::new("https://youtu.be/skillet1".into(), None, None));
         p.queue.push_back(Track::new("https://youtu.be/skillet2".into(), None, None));
@@ -2107,7 +2509,7 @@ mod tests {
 
     #[test]
     fn welcome_lists_playlists_and_recent() {
-        let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::Off, Vec::new());
+        let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::Off, Vec::new(), BroadcastConfig::default());
         p.remember(&Track::new("https://youtu.be/x".into(), Some("Brano X".into()), None));
         let mut pls = SavedPlaylists::new();
         pls.insert("lofi".into(), vec!["https://a".into(), "https://b".into()]);
@@ -2169,3 +2571,4 @@ mod tests {
         assert!(t.announce("Riproduco").contains("Brano"));
     }
 }
+

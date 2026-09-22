@@ -17,6 +17,7 @@ tslib-core = { path = "tslib/crates/tslib-core" }
 tslib-bot = { path = "tslib/crates/tslib-bot" }
 tslib-audio = { path = "tslib/crates/tslib-audio" }
 tslib-chat = { path = "tslib/crates/tslib-chat" }
+tslib-stream = { path = "tslib/crates/tslib-stream" }
 
 tokio = { version = "1.36", features = ["full"] }
 anyhow = "1.0"

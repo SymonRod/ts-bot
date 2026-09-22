@@ -9,6 +9,9 @@ services:
     image: ghcr.io/symonrod/ts-bot:latest
     container_name: ts-music-bot
     restart: unless-stopped
+    # Rete host: con !video i client TeamSpeak si collegano al bot in P2P
+    # (WebRTC su porte UDP casuali, nessun relay TURN disponibile).
+    network_mode: host
     environment:
       BOT_BIN: music-bot
       TS_SERVER: ${TS_SERVER:?imposta TS_SERVER nel file .env (es. voce.example.com:9987)}
@@ -16,6 +19,10 @@ services:
       TS_CHANNEL: ${TS_CHANNEL:-}
       TS_PASSWORD: ${TS_PASSWORD:-}
       TS_PREFIX: ${TS_PREFIX:-!}
+      # !video: qualità (altezza e kbit/s per viewer) e IP locale per WebRTC.
+      TS_VIDEO_HEIGHT: ${TS_VIDEO_HEIGHT:-}
+      TS_VIDEO_BITRATE: ${TS_VIDEO_BITRATE:-}
+      TS_VIDEO_BIND: ${TS_VIDEO_BIND:-}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       # Identità e stato persistente (identity-music.json, music-state.json).
