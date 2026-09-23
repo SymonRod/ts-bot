@@ -3,3 +3,5 @@ tslib/target/
 .data/
 data/
 *.log
+.git
+**/.git

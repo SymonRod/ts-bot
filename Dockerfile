@@ -5,9 +5,9 @@
 #   docker build -t ts-bot .
 #   docker run --rm -e TS_SERVER=voce.example.com:9987 ts-bot
 
-# ---------- builder ----------
+# ---------- base: toolchain + dipendenze di sistema ----------
 # rust:bookworm = stable corrente (il Cargo.lock richiede una toolchain recente).
-FROM rust:bookworm AS builder
+FROM rust:bookworm AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config cmake clang \
@@ -16,15 +16,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Copia prima i manifest per sfruttare la cache dei layer sulle dipendenze.
+# ---------- planner: scheletro con i soli manifest ----------
+# Tutti i Cargo.toml (anche quelli del submodule tslib) con sorgenti vuoti.
+# Il contenuto cambia solo se cambiano manifest o Cargo.lock, non il codice.
+FROM base AS planner
+COPY . /src
+RUN cd /src \
+    && find . -name Cargo.toml -not -path '*/target/*' | while read -r f; do \
+         d=/skel/$(dirname "$f"); mkdir -p "$d/src"; cp "$f" "$d/"; \
+         echo 'fn main() {}' > "$d/src/main.rs"; touch "$d/src/lib.rs"; \
+       done \
+    && cp Cargo.lock /skel/ && cp tslib/Cargo.lock /skel/tslib/ \
+    && rm /skel/src/lib.rs \
+    && mkdir -p /skel/src/bin && echo 'fn main() {}' > /skel/src/bin/music-bot.rs
+
+# ---------- builder ----------
+FROM base AS builder
+
+# Dipendenze compilate in un layer a sé: resta in cache finché lo scheletro
+# non cambia, quindi un commit che tocca solo il codice non le ricompila.
+COPY --from=planner /skel/ ./
+RUN cargo build --release --bin chat-bot --bin music-bot
+
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tslib ./tslib
 
-# Build dei due binari.
-# (Niente cache-mount BuildKit: così la build funziona anche senza BuildKit.
-#  In CI la cache è gestita da docker/build-push-action con type=gha.)
-RUN cargo build --release --bin chat-bot --bin music-bot \
+# touch: i sorgenti copiati possono avere mtime più vecchio degli stub,
+# e cargo li considererebbe già compilati.
+RUN find src tslib -name '*.rs' -exec touch {} + \
+    && cargo build --release --bin chat-bot --bin music-bot \
     && cp target/release/chat-bot /usr/local/bin/chat-bot \
     && cp target/release/music-bot /usr/local/bin/music-bot
 

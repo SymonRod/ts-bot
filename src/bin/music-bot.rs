@@ -41,7 +41,7 @@ use tslib_audio::codec::{Encoder, OpusEncoder};
 use tslib_audio::config::{AudioConfig, OpusApplication};
 use tslib_core::events::{AudioCodec, Event, MessageTarget};
 use tslib_core::{Client, ClientConfig, Identity, StreamSetup};
-use tslib_stream::{BroadcastConfig, BroadcastEvent, Broadcaster, EncoderConfig, VideoInput};
+use tslib_stream::{BroadcastConfig, BroadcastEvent, Broadcaster, EncoderConfig, VideoInput, VideoProgress};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Music bot TeamSpeak con tslib")]
@@ -204,7 +204,8 @@ impl BotState {
     }
 }
 
-/// Un brano in coda o in riproduzione: URL + titolo + copertina (se risolti via yt-dlp).
+/// Un brano in coda o in riproduzione: URL + titolo + copertina + durata
+/// (se risolti via yt-dlp).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Track {
     url: String,
@@ -215,20 +216,31 @@ struct Track {
     /// `[img]...[/img]` così il client TeamSpeak mostra la preview inline.
     #[serde(default)]
     thumbnail: Option<String>,
+    /// Durata in secondi (da yt-dlp). Se `Some`, alimenta la barra di
+    /// avanzamento in basso nel video e il conteggio in `!now`.
+    #[serde(default)]
+    duration_secs: Option<u64>,
 }
 
 impl Track {
-    fn new(url: String, title: Option<String>, thumbnail: Option<String>) -> Self {
+    fn new(
+        url: String,
+        title: Option<String>,
+        thumbnail: Option<String>,
+        duration_secs: Option<u64>,
+    ) -> Self {
         let title = title
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
         let thumbnail = thumbnail
             .map(|t| t.trim().to_string())
             .filter(|t| t.starts_with("http://") || t.starts_with("https://"));
+        let duration_secs = duration_secs.filter(|d| *d > 0);
         Self {
             url,
             title,
             thumbnail,
+            duration_secs,
         }
     }
 
@@ -674,7 +686,17 @@ impl Video {
 
     fn play(&mut self, track: &Track, height: u32, at: Duration) {
         self.showing_idle = false;
-        match self.broadcaster.play(VideoInput::Command(ytdlp_video_command(&track.url, height, at))) {
+        let command = ytdlp_video_command(&track.url, height, at);
+        // Barra in basso: quanto manca alla fine del video. Senza durata nota
+        // (live, URL diretti) si manda il video liscio come prima.
+        let input = match track.duration_secs.map(|d| (d as f64, at.as_secs_f64())) {
+            Some((total, off)) => match VideoProgress::new(total, off) {
+                Some(progress) => VideoInput::CommandWithProgress { command, progress },
+                None => VideoInput::Command(command),
+            },
+            None => VideoInput::Command(command),
+        };
+        match self.broadcaster.play(input) {
             Ok(()) => self.hold_audio_until = Some(Instant::now() + Self::MAX_AUDIO_HOLD),
             Err(e) => {
                 warn!("video non avviato: {e}");
@@ -1039,6 +1061,24 @@ fn format_pos(pos: Duration) -> String {
     }
 }
 
+/// Barra testuale di avanzamento per `!now` (la stessa info della barra in
+/// basso nel video): `[██████░░░░] 60%`, con quanto manca deducibile dalla
+/// parte vuota + `pos / totale` mostrato accanto.
+fn text_progress_bar(pos_secs: u64, total_secs: u64) -> String {
+    const WIDTH: u64 = 12;
+    if total_secs == 0 {
+        return String::new();
+    }
+    let pos = pos_secs.min(total_secs);
+    let filled = (pos * WIDTH / total_secs) as usize;
+    let pct = pos * 100 / total_secs;
+    format!(
+        "[{}{}] {pct}%",
+        "█".repeat(filled),
+        "░".repeat((WIDTH as usize).saturating_sub(filled))
+    )
+}
+
 /// Interpreta la posizione di `!seek`: `90`, `1:30` o `1:02:03`.
 fn parse_pos(raw: &str) -> Option<Duration> {
     let mut secs: u64 = 0;
@@ -1193,9 +1233,9 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
-/// Risolve un URL in uno o più brani con titolo + copertina.
+/// Risolve un URL in uno o più brani con titolo + copertina + durata.
 ///
-/// Usa `yt-dlp --flat-playlist --print "%(title)s ||| %(webpage_url)s ||| %(thumbnail)s"`:
+/// Usa `yt-dlp --flat-playlist --print "%(title)s ||| %(webpage_url)s ||| %(thumbnail)s ||| %(duration)s"`:
 /// se l'URL è una playlist (o un video con `&list=`), restituisce tutti i brani;
 /// se è un singolo video, restituisce un solo brano.
 ///
@@ -1214,7 +1254,7 @@ async fn resolve_tracks(url: String) -> Vec<Track> {
                 "--no-warnings",
                 "--quiet",
                 "--print",
-                "%(title)s ||| %(webpage_url)s ||| %(thumbnail)s",
+                "%(title)s ||| %(webpage_url)s ||| %(thumbnail)s ||| %(duration)s",
                 &url,
             ])
             .output(),
@@ -1243,11 +1283,13 @@ async fn resolve_tracks(url: String) -> Vec<Track> {
         if line.is_empty() {
             continue;
         }
-        // Formato: "titolo ||| url ||| thumbnail" (thumbnail può mancare/essere "NA").
-        let mut parts = line.splitn(3, " ||| ");
+        // Formato: "titolo ||| url ||| thumbnail ||| durata".
+        // Thumbnail e durata possono mancare/essere "NA".
+        let mut parts = line.splitn(4, " ||| ");
         let title = parts.next().unwrap_or("").trim();
         let link = parts.next().unwrap_or("").trim();
         let thumb = parts.next().unwrap_or("").trim();
+        let duration = parts.next().unwrap_or("").trim();
         if link.is_empty() {
             continue;
         }
@@ -1260,7 +1302,7 @@ async fn resolve_tracks(url: String) -> Vec<Track> {
         } else {
             Some(title.to_string())
         };
-        tracks.push(Track::new(link.to_string(), title, thumb));
+        tracks.push(Track::new(link.to_string(), title, thumb, parse_duration(duration)));
     }
     if tracks.is_empty() {
         fallback_tracks(url)
@@ -1270,13 +1312,22 @@ async fn resolve_tracks(url: String) -> Vec<Track> {
     }
 }
 
+/// Durata di yt-dlp (`%(duration)s`): secondi, anche decimali, oppure "NA".
+fn parse_duration(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("na") || raw == "none" {
+        return None;
+    }
+    raw.parse::<f64>().ok().filter(|d| d.is_finite() && *d > 0.0).map(|d| d as u64)
+}
+
 /// Fallback quando yt-dlp non risolve: l'URL grezzo si può comunque provare
 /// a riprodurre, una ricerca senza risultati no.
 fn fallback_tracks(url: String) -> Vec<Track> {
     if is_search_spec(&url) {
         Vec::new()
     } else {
-        vec![Track::new(url, None, None)]
+        vec![Track::new(url, None, None, None)]
     }
 }
 
@@ -2187,7 +2238,7 @@ fn handle_chat(
                 // Se c'è già uno stream, la sinusoide lo sostituisce (e svuota la coda? no: resta).
                 kill_source(&mut player.source);
                 player.source = Source::Sine { freq: f, phase: 0.0 };
-                player.current = Some(Track::new(format!("sine {f:.0}Hz"), Some(format!("sine {f:.0}Hz")), None));
+                player.current = Some(Track::new(format!("sine {f:.0}Hz"), Some(format!("sine {f:.0}Hz")), None, None));
                 player.paused = false;
                 player.eq.reset();
                 let _ = client.set_input_muted(false);
@@ -2316,9 +2367,20 @@ fn handle_chat(
         }
         "now" | "nowplaying" | "np" => {
             let state = if player.paused { " (in pausa)" } else { "" };
+            let pos = match &player.current {
+                Some(c) => match c.duration_secs {
+                    Some(total) => format!(
+                        "{} / {} {}",
+                        format_pos(player.position),
+                        format_pos(Duration::from_secs(total)),
+                        text_progress_bar(player.position.as_secs(), total)
+                    ),
+                    None => format_pos(player.position),
+                },
+                None => format_pos(player.position),
+            };
             let extra = format!(
-                "(a {}, vol {:.0}%, loop {}, {})",
-                format_pos(player.position),
+                "(a {pos}, vol {:.0}%, loop {}, {})",
                 player.volume * 100.0,
                 player.loop_mode.as_str(),
                 player.eq_summary()
@@ -2718,11 +2780,13 @@ mod tests {
             "https://youtu.be/x".to_string(),
             Some("Titolo".to_string()),
             Some("https://i.ytimg.com/vi/x/hqdefault.jpg".to_string()),
+            Some(213),
         );
         let msg = t.announce("Riproduco");
         assert!(msg.contains("[img]https://i.ytimg.com/vi/x/hqdefault.jpg[/img]"));
         assert!(msg.contains("[b]"));
-        let plain = Track::new("https://youtu.be/x".to_string(), None, None);
+        assert_eq!(t.duration_secs, Some(213));
+        let plain = Track::new("https://youtu.be/x".to_string(), None, None, None);
         assert!(!plain.announce("Riproduco").contains("[img]"));
         assert!(plain.display() == "https://youtu.be/x");
     }
@@ -2731,12 +2795,12 @@ mod tests {
     fn recent_dedups_and_caps() {
         let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::Off, Vec::new(), BroadcastConfig::default());
         for i in 0..15 {
-            p.remember(&Track::new(format!("https://youtu.be/{i}"), None, None));
+            p.remember(&Track::new(format!("https://youtu.be/{i}"), None, None, None));
         }
         assert_eq!(p.recent.len(), Player::RECENT_MAX);
         assert_eq!(p.recent[0].url, "https://youtu.be/14");
         // Riascoltare un brano lo riporta in testa senza duplicarlo.
-        p.remember(&Track::new("https://youtu.be/10".into(), None, None));
+        p.remember(&Track::new("https://youtu.be/10".into(), None, None, None));
         assert_eq!(p.recent[0].url, "https://youtu.be/10");
         assert_eq!(p.recent.iter().filter(|t| t.url == "https://youtu.be/10").count(), 1);
     }
@@ -2744,12 +2808,12 @@ mod tests {
     #[test]
     fn replace_queue_drops_old_tracks_and_skips_loop() {
         let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::All, Vec::new(), BroadcastConfig::default());
-        p.current = Some(Track::new("https://youtu.be/skillet0".into(), None, None));
-        p.queue.push_back(Track::new("https://youtu.be/skillet1".into(), None, None));
-        p.queue.push_back(Track::new("https://youtu.be/skillet2".into(), None, None));
+        p.current = Some(Track::new("https://youtu.be/skillet0".into(), None, None, None));
+        p.queue.push_back(Track::new("https://youtu.be/skillet1".into(), None, None, None));
+        p.queue.push_back(Track::new("https://youtu.be/skillet2".into(), None, None, None));
         p.replace_queue(vec![
-            Track::new("https://youtu.be/lp1".into(), None, None),
-            Track::new("https://youtu.be/lp2".into(), None, None),
+            Track::new("https://youtu.be/lp1".into(), None, None, None),
+            Track::new("https://youtu.be/lp2".into(), None, None, None),
         ]);
         let urls: Vec<&str> = p.queue.iter().map(|t| t.url.as_str()).collect();
         assert_eq!(urls, ["https://youtu.be/lp1", "https://youtu.be/lp2"]);
@@ -2762,7 +2826,7 @@ mod tests {
     #[test]
     fn welcome_lists_playlists_and_recent() {
         let mut p = Player::new(1.0, Eq::new(0.0, 0.0, 0.0), "flat".into(), LoopMode::Off, Vec::new(), BroadcastConfig::default());
-        p.remember(&Track::new("https://youtu.be/x".into(), Some("Brano X".into()), None));
+        p.remember(&Track::new("https://youtu.be/x".into(), Some("Brano X".into()), None, None));
         let mut pls = SavedPlaylists::new();
         pls.insert("lofi".into(), vec!["https://a".into(), "https://b".into()]);
         let msg = welcome_message("Mario", &p, &pls);
@@ -2818,9 +2882,128 @@ mod tests {
             "https://example.com/x.mp3".to_string(),
             Some("Brano".to_string()),
             Some("NA".to_string()),
+            None,
         );
         assert!(t.thumbnail.is_none());
         assert!(t.announce("Riproduco").contains("Brano"));
+    }
+
+    #[test]
+    fn duration_parses_yt_dlp_format() {
+        assert_eq!(parse_duration("213"), Some(213));
+        assert_eq!(parse_duration("213.7"), Some(213));
+        assert_eq!(parse_duration("NA"), None);
+        assert_eq!(parse_duration("none"), None);
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("0"), None);
+        assert_eq!(parse_duration("-5"), None);
+        assert_eq!(parse_duration("abc"), None);
+    }
+
+    #[test]
+    fn track_drops_zero_duration() {
+        let t = Track::new("https://youtu.be/x".to_string(), None, None, Some(0));
+        assert_eq!(t.duration_secs, None);
+    }
+
+    #[test]
+    fn text_progress_bar_shows_elapsed_and_left() {
+        let bar = text_progress_bar(0, 200);
+        assert!(bar.contains("[░░░░░░░░░░░░] 0%"), "{bar}");
+        let bar = text_progress_bar(100, 200);
+        assert!(bar.contains("[██████░░░░░░] 50%"), "{bar}");
+        let bar = text_progress_bar(200, 200);
+        assert!(bar.contains("[████████████] 100%"), "{bar}");
+        // Oltre la fine: clamp a pieno, niente panico.
+        let bar = text_progress_bar(999, 200);
+        assert!(bar.contains("100%"), "{bar}");
+        assert_eq!(text_progress_bar(10, 0), "");
+    }
+
+    /// La barra in basso nel video deve passare per gli stessi tre livelli di
+    /// escaping del grafo idle: l'unica verifica affidabile è farla
+    /// renderizzare a ffmpeg. Saltato se ffmpeg non c'è.
+    #[test]
+    fn video_progress_bar_renders() {
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        for (total, off) in [(213.0, 0.0), (3723.0, 42.5)] {
+            let progress = VideoProgress::new(total, off).expect("progress valida");
+            let vf = format!(
+                "testsrc2=size=640x480:rate=30{}",
+                VideoInput::progress_filter(Some(progress), 480)
+            );
+            let out = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", &vf])
+                .args(["-frames:v", "3", "-f", "null", "-"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{vf}\n{}", String::from_utf8_lossy(&out.stderr));
+        }
+        // Senza durata niente filtro: video liscio come prima.
+        assert_eq!(VideoInput::progress_filter(None, 480), "");
+        assert!(VideoProgress::new(0.0, 0.0).is_none());
+        assert!(VideoProgress::new(f64::NAN, 0.0).is_none());
+    }
+
+    /// La barra deve partire quasi vuota, riempirsi col tempo e stare
+    /// davvero in basso (drawbox non rivaluta la geometria per-frame:
+    /// una larghezza animata con `t` resterebbe congelata, qui i segmenti
+    /// si accendono via `enable`). Su sfondo nero ogni pixel rosso in
+    /// basso può venire solo dalla barra.
+    #[test]
+    fn video_progress_bar_grows_along_the_bottom() {
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let total = 2.0;
+        let height = 240u32;
+        let bar_h = 8usize; // (240/48).clamp(8,18), deve restare in sync col filtro
+        let (w, h) = (320usize, 240usize);
+        let progress = VideoProgress::new(total, 0.0).expect("progress valida");
+        let vf = format!(
+            "color=black:size={w}x{h}:rate=30{}",
+            VideoInput::progress_filter(Some(progress), height)
+        );
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", &vf])
+            .args(["-frames:v", "60", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{vf}\n{}", String::from_utf8_lossy(&out.stderr));
+        let frame_bytes = w * h * 3;
+        assert_eq!(out.stdout.len(), 60 * frame_bytes, "frame inattesi");
+
+        // Frazione di rosso nella banda in basso e (controllo) sopra di essa.
+        let red_frac = |frame: &[u8], rows: std::ops::Range<usize>| -> f64 {
+            let mut red = 0usize;
+            let mut tot = 0usize;
+            for y in rows {
+                for x in 0..w {
+                    let o = (y * w + x) * 3;
+                    tot += 1;
+                    if frame[o] > 150 && frame[o + 1] < 100 && frame[o + 2] < 100 {
+                        red += 1;
+                    }
+                }
+            }
+            red as f64 / tot as f64
+        };
+        let frame = |n: usize| &out.stdout[n * frame_bytes..(n + 1) * frame_bytes];
+        let bottom = (h - bar_h)..h;
+        let above = 0..(h - bar_h);
+
+        let early = red_frac(frame(2), bottom.clone());
+        let late = red_frac(frame(57), bottom.clone());
+        assert!(early < 0.10, "a inizio video la barra deve essere quasi vuota, rosso={early:.3}");
+        assert!(late > 0.80, "a fine video la barra deve essere quasi piena, rosso={late:.3}");
+        assert!(late > early + 0.5, "la barra deve crescere nel tempo ({early:.3} -> {late:.3})");
+        // Niente rosso sopra la banda: la barra sta in basso, non in mezzo.
+        assert!(
+            red_frac(frame(57), above) < 0.01,
+            "rosso fuori dalla banda in basso"
+        );
     }
 }
 
