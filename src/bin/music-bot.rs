@@ -1642,7 +1642,14 @@ async fn main() -> Result<()> {
                                 }
                                 Event::StreamsChanged { .. } => {
                                     if let Some(video) = &mut player.video {
-                                        let own = client.own_streams().into_iter().next().map(|s| s.id);
+                                        // Lo stream che abbiamo già resta finché esiste: se ne
+                                        // compare un secondo non va preso il primo della lista.
+                                        let own_streams = client.own_streams();
+                                        let own = video
+                                            .stream_id
+                                            .clone()
+                                            .filter(|id| own_streams.iter().any(|s| &s.id == id))
+                                            .or_else(|| own_streams.into_iter().next().map(|s| s.id));
                                         if own != video.stream_id {
                                             info!("Stream video: {own:?}");
                                             video.stream_id = own;
@@ -1650,14 +1657,25 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 Event::StreamJoinRequest { viewer_id, stream_id, is_remove } => {
-                                    if let Some(video) = &mut player.video {
-                                        if video.stream_id.as_deref() == Some(stream_id.as_str()) {
-                                            if is_remove {
-                                                info!("[video] {viewer_id} ha chiuso lo stream");
-                                                video.broadcaster.remove_viewer(viewer_id);
-                                            } else {
-                                                info!("[video] {viewer_id} apre lo stream");
-                                                video.broadcaster.add_viewer(viewer_id);
+                                    let current = player
+                                        .video
+                                        .as_mut()
+                                        .filter(|v| v.stream_id.as_deref() == Some(stream_id.as_str()));
+                                    match current {
+                                        Some(video) if is_remove => {
+                                            info!("[video] {viewer_id} ha chiuso lo stream");
+                                            video.broadcaster.remove_viewer(viewer_id);
+                                        }
+                                        Some(video) => {
+                                            info!("[video] {viewer_id} apre lo stream");
+                                            video.broadcaster.add_viewer(viewer_id);
+                                        }
+                                        None if is_remove => {}
+                                        // Senza risposta il client resta su "Waiting to be let in".
+                                        None => {
+                                            warn!("[video] {viewer_id} chiede lo stream sconosciuto {stream_id}: rifiuto");
+                                            if let Err(e) = client.refuse_stream_viewer(viewer_id, &stream_id) {
+                                                warn!("refuse_stream_viewer: {e}");
                                             }
                                         }
                                     }
