@@ -1226,7 +1226,7 @@ fn spawn_seeked_stream(url: &str, at: Duration) -> Result<PipeStream> {
     let script = format!(
         "exec ffmpeg -hide_banner -loglevel error -ss {ss:.3} \
          -i \"$(yt-dlp -f bestaudio -g --no-playlist --quiet --no-warnings {url})\" \
-         -f s16le -ar 48000 -ac 1 pipe:1",
+         -f s16le -ar 48000 -ac 2 pipe:1",
         ss = at.as_secs_f64(),
         url = shell_quote(url),
     );
@@ -1608,6 +1608,7 @@ async fn main() -> Result<()> {
     };
     let frame_samples = audio_cfg.frame_size_samples() * 2; // 960 per canale, interleaved
     let mut encoder = OpusEncoder::new(&audio_cfg)?;
+    encoder.tune_for_music()?;
     let mut encode_buf = vec![0u8; 4000];
 
     let mut player = Player::new(
