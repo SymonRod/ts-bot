@@ -91,6 +91,11 @@ struct Args {
     #[arg(long, default_value_t = 800)]
     video_bitrate: u32,
 
+    /// Bitrate dell'audio Opus in kbit/s (stereo). 96 è un buon compromesso
+    /// per la musica; 128+ per un risultato quasi trasparente.
+    #[arg(long, default_value_t = 96)]
+    audio_bitrate: u32,
+
     /// Indirizzo locale per WebRTC (es. 192.168.1.10:0). Default: tutte le
     /// interfacce, bridge Docker compresi.
     #[arg(long)]
@@ -376,6 +381,10 @@ struct Eq {
     low: Biquad,
     peak: Biquad,
     high: Biquad,
+    /// Stessa catena per il canale destro (il PCM è stereo interleaved).
+    low_r: Biquad,
+    peak_r: Biquad,
+    high_r: Biquad,
 }
 
 impl Eq {
@@ -389,6 +398,9 @@ impl Eq {
             low: Biquad::identity(),
             peak: Biquad::identity(),
             high: Biquad::identity(),
+            low_r: Biquad::identity(),
+            peak_r: Biquad::identity(),
+            high_r: Biquad::identity(),
         };
         eq.set_gains(bass_db, mid_db, treble_db);
         eq
@@ -405,22 +417,33 @@ impl Eq {
         self.low = Self::low_shelf(200.0, self.bass_db);
         self.peak = Self::peaking(1000.0, 1.0, self.mid_db);
         self.high = Self::high_shelf(6000.0, self.treble_db);
+        self.low_r = self.low.clone();
+        self.peak_r = self.peak.clone();
+        self.high_r = self.high.clone();
     }
 
     fn reset(&mut self) {
         self.low.reset();
         self.peak.reset();
         self.high.reset();
+        self.low_r.reset();
+        self.peak_r.reset();
+        self.high_r.reset();
     }
 
-    /// Applica l'EQ in place sui sample. No-op se flat.
+    /// Applica l'EQ in place su PCM stereo interleaved (L, R, L, R...).
+    /// No-op se flat.
     fn apply(&mut self, pcm: &mut [i16]) {
         if self.is_flat() {
             return;
         }
-        for s in pcm.iter_mut() {
+        for (i, s) in pcm.iter_mut().enumerate() {
             let x = *s as f32 / 32768.0;
-            let y = self.high.process(self.peak.process(self.low.process(x)));
+            let y = if i % 2 == 0 {
+                self.high.process(self.peak.process(self.low.process(x)))
+            } else {
+                self.high_r.process(self.peak_r.process(self.low_r.process(x)))
+            };
             *s = (y * 32768.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
         }
     }
@@ -608,7 +631,7 @@ enum Source {
     Stream { stream: PipeStream },
 }
 
-/// Processo yt-dlp -> ffmpeg con stdout PCM s16le mono 48kHz da leggere a frame.
+/// Processo yt-dlp -> ffmpeg con stdout PCM s16le stereo 48kHz da leggere a frame.
 struct PipeStream {
     /// Assente quando si riparte da un seek: lì ffmpeg apre la URL diretta
     /// da solo, senza yt-dlp a monte nella pipe.
@@ -616,13 +639,13 @@ struct PipeStream {
     ffmpeg: tokio::process::Child,
     stdout: tokio::process::ChildStdout,
     /// Buffer di accumulo: ffmpeg produce più in fretta del realtime,
-    /// ne consumiamo un frame (960 sample) per tick da 20ms.
+    /// ne consumiamo un frame (960 sample per canale) per tick da 20ms.
     pending: Vec<u8>,
 }
 
 impl PipeStream {
-    /// Un frame = 960 sample mono s16le = 1920 byte.
-    const FRAME_BYTES: usize = 960 * 2;
+    /// Un frame = 960 sample per canale, stereo s16le = 3840 byte.
+    const FRAME_BYTES: usize = 960 * 2 * 2;
     /// Cap del buffer (~2s di audio): oltre, non leggiamo per fare backpressure su ffmpeg.
     const MAX_PENDING: usize = Self::FRAME_BYTES * 100;
 }
@@ -1123,7 +1146,7 @@ fn apply_volume(pcm: &mut [i16], volume: f32) {
 }
 
 /// Avvia `yt-dlp -f bestaudio -o - <url>` pipato in
-/// `ffmpeg -i pipe:0 -f s16le -ar 48000 -ac 1 pipe:1`.
+/// `ffmpeg -i pipe:0 -f s16le -ar 48000 -ac 2 pipe:1`.
 ///
 /// Con `at` > 0 (seek) si salta il passaggio per la pipe: `yt-dlp -g` dà la
 /// URL diretta del flusso e ffmpeg ci si posiziona sopra con `-ss`, scaricando
@@ -1173,7 +1196,7 @@ fn spawn_stream(url: &str, at: Duration) -> Result<PipeStream> {
             "-ar",
             "48000",
             "-ac",
-            "1",
+            "2",
             "pipe:1",
         ])
         .stdin(ytdlp_stdio)
@@ -1575,16 +1598,17 @@ async fn main() -> Result<()> {
     // quando trasmettiamo musica.
     let _ = client.set_input_muted(false);
 
-    // --- Encoder Opus per la musica (mono 48kHz, 20ms) ---
+    // --- Encoder Opus per la musica (stereo 48kHz, 20ms) ---
     let audio_cfg = AudioConfig {
-        channels: 1,
+        channels: 2,
+        bitrate: args.audio_bitrate.clamp(16, 510) * 1000,
         opus_application: OpusApplication::Audio,
         vad_enabled: false,
         ..AudioConfig::default()
     };
-    let frame_samples = audio_cfg.frame_size_samples(); // 960
+    let frame_samples = audio_cfg.frame_size_samples() * 2; // 960 per canale, interleaved
     let mut encoder = OpusEncoder::new(&audio_cfg)?;
-    let mut encode_buf = vec![0u8; 1024];
+    let mut encode_buf = vec![0u8; 4000];
 
     let mut player = Player::new(
         saved.volume,
@@ -1958,9 +1982,9 @@ async fn main() -> Result<()> {
                     Source::Sine { freq, phase } => {
                         let freq = *freq;
                         let mut pcm = vec![0i16; frame_samples];
-                        for s in pcm.iter_mut() {
+                        for frame in pcm.chunks_exact_mut(2) {
                             let v = (*phase * 2.0 * std::f64::consts::PI).sin();
-                            *s = (v * 8000.0) as i16;
+                            frame.fill((v * 8000.0) as i16);
                             *phase += freq / sample_rate;
                             if *phase >= 1.0 { *phase -= 1.0; }
                         }

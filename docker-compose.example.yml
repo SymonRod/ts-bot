@@ -22,6 +22,7 @@ services:
       # !video: qualità (altezza e kbit/s per viewer) e IP locale per WebRTC.
       TS_VIDEO_HEIGHT: ${TS_VIDEO_HEIGHT:-}
       TS_VIDEO_BITRATE: ${TS_VIDEO_BITRATE:-}
+      TS_AUDIO_BITRATE: ${TS_AUDIO_BITRATE:-}
       TS_VIDEO_BIND: ${TS_VIDEO_BIND:-}
       # 1 = video acceso all'avvio, senza dover dare !video on.
       TS_VIDEO_AUTO: ${TS_VIDEO_AUTO:-}
